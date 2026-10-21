@@ -80,6 +80,16 @@ WINE_DECLARE_DEBUG_CHANNEL(seh);
 
 #include "dwarf.h"
 
+#ifdef __linux__
+#include <errno.h>
+#include <string.h>
+#include <sys/prctl.h>
+#include <sys/stat.h>
+#include <linux/audit.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
+#endif
+
 #ifdef __APPLE__
 /* CW Hack 24256 */
 #include <sys/sysctl.h>
@@ -2824,12 +2834,15 @@ __ASM_GLOBAL_FUNC( __restore_mxcsr_thunk,
                    "ldmxcsr 0x33c(%rcx)\n\t"  /* amd64_thread_data()->mxcsr */
                    "popq %rcx\n\t"
                    "jmp " __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_prolog_end") );
+#endif
 
+#if defined(__APPLE__) || defined(__linux__)
 /**********************************************************************
  *		sigsys_handler
  *
- * Handler for SIGSYS, signals that a non-existent system call was invoked.
- * Only called on macOS 14 Sonoma and later.
+ * Handler for SIGSYS, signals that a system call was made outside Wine's dispatcher: a non-existent
+ * one on macOS 14 Sonoma and later, one that the seccomp filter of install_bpf traps on Linux. Both
+ * are Windows system calls, which go to the dispatcher.
  */
 static void sigsys_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 {
@@ -2838,6 +2851,15 @@ static void sigsys_handler( int signal, siginfo_t *siginfo, void *sigcontext )
     struct syscall_frame *frame = get_syscall_frame();
 
     TRACE_(seh)("SIGSYS, rax %#llx, rip %#llx.\n", RAX_sig(ucontext), RIP_sig(ucontext));
+
+#ifdef __linux__
+    if (RAX_sig(ucontext) == 0xffff)
+    {
+        /* The test system call of install_bpf, made from the Unix side. */
+        RAX_sig(ucontext) = STATUS_INVALID_PARAMETER;
+        return;
+    }
+#endif
 
     frame->rip = RIP_sig(ucontext) + 0xb;
     frame->rcx = RIP_sig(ucontext);
@@ -2853,6 +2875,7 @@ static void sigsys_handler( int signal, siginfo_t *siginfo, void *sigcontext )
     }
     RIP_sig(ucontext) = (ULONG64)__wine_syscall_dispatcher_prolog_end_ptr;
 
+#ifdef __APPLE__
     /* CW Hack 24265 */
     if (is_rosetta2 && FPU_sig(ucontext))
     {
@@ -2873,6 +2896,7 @@ static void sigsys_handler( int signal, siginfo_t *siginfo, void *sigcontext )
             RIP_sig(ucontext) = (ULONG64)__restore_mxcsr_thunk;
         }
     }
+#endif
 }
 #endif
 
@@ -2989,6 +3013,183 @@ static void *mac_thread_gsbase(void)
 #endif
 
 
+#ifdef __linux__
+/* The native libraries are loaded at high addresses: a system call made below comes from Windows code. */
+#define NATIVE_SYSCALL_ADDRESS_START 0x700000000000
+
+/* The executable mappings of the program the process was started as, its preloader. A static-pie preloader
+ * is not at Proton's fixed 0x7d400000: the kernel places it at ELF_ET_DYN_BASE, which the Linux engine of
+ * voile-lkd does not randomize, so the processes this one starts load theirs at the same addresses. */
+static BOOL get_preloader_range( ULONG_PTR *start, ULONG_PTR *end )
+{
+    char exe[1024], line[1024 + 128];
+    struct stat st;
+    ssize_t len;
+    FILE *f;
+
+    *start = *end = 0;
+    if ((len = readlink( "/proc/self/exe", exe, sizeof(exe) - 1 )) <= 0) return FALSE;
+    exe[len] = 0;
+    if (stat( "/proc/self/exe", &st )) st.st_ino = 0;
+    if (!(f = fopen( "/proc/self/maps", "r" ))) return FALSE;
+    while (fgets( line, sizeof(line), f ))
+    {
+        unsigned long lo, hi, inode;
+        char perms[5], *path;
+        int pos = 0;
+
+        if (sscanf( line, "%lx-%lx %4s %*s %*s %lu %n", &lo, &hi, perms, &inode, &pos ) < 4 || !pos) continue;
+        if (perms[2] != 'x') continue;
+        path = line + pos;
+        path[strcspn( path, "\n" )] = 0;
+        if (strcmp( path, exe ) && !(st.st_ino && inode == st.st_ino)) continue;
+        if (!*start || lo < *start) *start = lo;
+        if (hi > *end) *end = hi;
+    }
+    fclose( f );
+    return *end > *start;
+}
+
+static int sc_seccomp( unsigned int operation, unsigned int flags, void *args )
+{
+#ifndef __NR_seccomp
+#   define __NR_seccomp 317
+#endif
+    return syscall( __NR_seccomp, operation, flags, args );
+}
+
+/**********************************************************************
+ *		install_bpf
+ *
+ * Trap the system calls Windows code makes itself instead of calling ntdll, as Proton does: a seccomp
+ * filter sends those made below the native libraries to sigsys_handler, which takes them to the dispatcher.
+ * Without it the kernel runs them as Linux system calls of the same numbers.
+ */
+static void install_bpf( struct sigaction *sig_act )
+{
+#ifndef SECCOMP_FILTER_FLAG_SPEC_ALLOW
+#   define SECCOMP_FILTER_FLAG_SPEC_ALLOW (1UL << 2)
+#endif
+#ifndef SECCOMP_SET_MODE_FILTER
+#   define SECCOMP_SET_MODE_FILTER 1
+#endif
+    static const BYTE syscall_trap_test[] =
+    {
+        0x48, 0x89, 0xf8,   /* mov %rdi, %rax */
+        0x0f, 0x05,         /* syscall */
+        0xc3,               /* retq */
+    };
+    static struct sock_filter filter[] =
+    {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, instruction_pointer) + 4),
+        /* Native libs are loaded at high addresses. */
+        BPF_JUMP(BPF_JMP | BPF_JGT | BPF_K, NATIVE_SYSCALL_ADDRESS_START >> 32, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        /* Allow i386. */
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 1, 0),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        /* Allow the preloader of this process, filled in below: high word, then the low word range. */
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, instruction_pointer) + 4),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 4),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, instruction_pointer)),
+        BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 0, 0, 2),
+        BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 0, 1, 0),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        /* Allow wine64-preloader */
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, instruction_pointer)),
+        BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 0x7d400000, 1, 0),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
+        BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 0x7d402000, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+    long (*test_syscall)(long sc_number);
+    struct sock_fprog prog;
+    ULONG_PTR preloader_start, preloader_end;
+    NTSTATUS status;
+
+    if ((ULONG_PTR)sc_seccomp < NATIVE_SYSCALL_ADDRESS_START
+            || (ULONG_PTR)syscall < NATIVE_SYSCALL_ADDRESS_START)
+    {
+        ERR_(seh)("Native libs are being loaded in low addresses, sc_seccomp %p, syscall %p, not installing seccomp.\n",
+                sc_seccomp, syscall);
+        return;
+    }
+
+    sig_act->sa_sigaction = sigsys_handler;
+    if (sigaction( SIGSYS, sig_act, NULL ) == -1)
+    {
+        ERR_(seh)("sigaction(SIGSYS): %s.\n", strerror(errno));
+        return;
+    }
+
+    test_syscall = mmap( (void *)0x600000000000, 0x1000, PROT_EXEC | PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANON, -1, 0 );
+    if (test_syscall != (void *)0x600000000000)
+    {
+        int ret;
+
+        ERR_(seh)("Could not allocate test syscall, falling back to seccomp presence check, test_syscall %p, errno %d.\n",
+                test_syscall, errno);
+        if (test_syscall != MAP_FAILED) munmap( test_syscall, 0x1000 );
+
+        if ((ret = prctl( PR_GET_SECCOMP, 0, NULL, 0, 0 )))
+        {
+            if (ret == 2)
+                TRACE_(seh)("Seccomp filters already installed.\n");
+            else
+                ERR_(seh)("Seccomp filters cannot be installed, ret %d, error %s.\n", ret, strerror(errno));
+            return;
+        }
+    }
+    else
+    {
+        memcpy( test_syscall, syscall_trap_test, sizeof(syscall_trap_test) );
+        status = test_syscall( 0xffff );
+        munmap( test_syscall, 0x1000 );
+        if (status == STATUS_INVALID_PARAMETER)
+        {
+            TRACE_(seh)("Seccomp filters already installed.\n");
+            return;
+        }
+        if (status != -ENOSYS && (status != -1 || errno != ENOSYS))
+        {
+            ERR_(seh)("Unexpected status %#x, errno %d.\n", status, errno);
+            return;
+        }
+    }
+
+    if (get_preloader_range( &preloader_start, &preloader_end )
+            && preloader_start < NATIVE_SYSCALL_ADDRESS_START
+            && preloader_start >> 32 == (preloader_end - 1) >> 32)
+    {
+        TRACE_(seh)("Allowing the preloader at %#lx-%#lx.\n", preloader_start, preloader_end);
+        filter[7].k = preloader_start >> 32;
+        filter[9].k = (unsigned int)preloader_start;
+        filter[10].k = (unsigned int)preloader_end;
+    }
+    else filter[7].k = ~0u;  /* no instruction pointer has this high word */
+
+    TRACE_(seh)("Installing seccomp filters.\n");
+
+    prog.len = ARRAY_SIZE(filter);
+    prog.filter = filter;
+
+    if (prctl( PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0 ))
+    {
+        ERR_(seh)("prctl(PR_SET_NO_NEW_PRIVS, ...): %s.\n", strerror(errno));
+        return;
+    }
+    if (sc_seccomp( SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_SPEC_ALLOW, &prog ))
+    {
+        ERR_(seh)("prctl(PR_SET_SECCOMP, ...): %s.\n", strerror(errno));
+        return;
+    }
+}
+#endif
+
+
 /**********************************************************************
  *		signal_init_process
  */
@@ -3062,6 +3263,9 @@ void signal_init_process(void)
 #ifdef __APPLE__
     sig_act.sa_sigaction = sigsys_handler;
     if (sigaction( SIGSYS, &sig_act, NULL ) == -1) goto error;
+#endif
+#ifdef __linux__
+    install_bpf( &sig_act );
 #endif
     return;
 
