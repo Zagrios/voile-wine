@@ -47,7 +47,7 @@ enum {
   WSD_AUDIO_STOP = 22,     /* wsd_audio_stream: pause, unread frames stay in the ring */
   WSD_AUDIO_RESET = 23,    /* wsd_audio_stream: (stopped) drop unread frames: read position = write position */
   WSD_AUDIO_CLOSE = 24,    /* wsd_audio_stream */
-  WSD_AUDIO_OPEN_INPUT = 29, /* wsd_audio_open + 1 fd: an input stream (the default microphone) writing a shared ring */
+  WSD_AUDIO_OPEN_INPUT = 34, /* wsd_audio_open + 1 fd: an input stream (the default microphone) writing a shared ring */
 };
 
 /* server -> client */
