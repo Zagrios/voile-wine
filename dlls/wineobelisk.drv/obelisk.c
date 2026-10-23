@@ -29,6 +29,8 @@
 
 #include "config.h"
 
+#define OEMRESOURCE
+
 #include <errno.h>
 #include <pthread.h>
 #include <poll.h>
@@ -88,7 +90,7 @@ struct obelisk_win
 };
 
 /* driver messages, handled by OBELISK_WindowMessage in the window's thread */
-enum { WM_OBELISK_APPLY_FRAME = WM_WINE_FIRST_DRIVER_MSG };
+enum { WM_OBELISK_APPLY_FRAME = WM_WINE_FIRST_DRIVER_MSG, WM_OBELISK_TAKE_FOCUS };
 
 static int wsd_fd = -1;
 static pthread_mutex_t write_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -96,7 +98,8 @@ static pthread_mutex_t win_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct obelisk_win windows[WSD_MAX_WINDOWS];
 static UINT next_buffer_id = 1;
 static UINT64 present_serial;
-static struct wsd_hello_reply hello;
+static pthread_mutex_t display_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct wsd_hello_reply hello;  /* display_lock held: the screen, from EV_HELLO then EV_DISPLAY */
 static BOOL cursor_visible = TRUE;
 static const WCHAR obelisk_window_propW[] = {'_','_','w','i','n','e','_','o','b','e','l','i','s','k','_','w','i','n','d','o','w',0};
 static void (*release_listener)( UINT buffer_id, UINT shown, UINT64 serial );
@@ -106,6 +109,7 @@ static BOOL wsd_send( UINT type, const void *payload, UINT len, const void *extr
 static UINT relative_window;  /* wsd window in relative mouse mode, 0 when none */
 static BOOL clip_active;
 static float relative_rest_x, relative_rest_y;  /* fractions of a pixel not sent yet */
+static UINT64 last_warp_ns;  /* SetCursorPos: the mouse moves wsd sent before it carry the old place */
 
 /* Relative (raw delta) mouse while the game hides the cursor and confines it to its window, like a captured mouse
  * on Windows; absolute otherwise. */
@@ -266,15 +270,21 @@ static BOOL is_toplevel( HWND hwnd )
 }
 
 /* The wsd frame of a Win32 window: a window with a caption gets the macOS title bar and the buttons its system
- * menu, minimize box and sizing border ask for (the same rule as winemac.drv); any other one is borderless. */
+ * menu, minimize box and sizing border ask for (the same rule as winemac.drv); any other one is borderless. A topmost
+ * window stays above the others, a WS_EX_NOACTIVATE one never takes the keyboard. */
 static UINT frame_style( UINT style, UINT ex_style )
 {
     UINT ret = WSD_STYLE_TITLED;
 
-    if ((style & WS_CAPTION) != WS_CAPTION || (ex_style & WS_EX_LAYERED)) return WSD_STYLE_BORDERLESS;
-    if (style & WS_SYSMENU) ret |= WSD_STYLE_CLOSABLE;
-    if (style & WS_MINIMIZEBOX) ret |= WSD_STYLE_MINIATURIZABLE;
-    if (style & WS_THICKFRAME) ret |= WSD_STYLE_RESIZABLE;
+    if ((style & WS_CAPTION) != WS_CAPTION || (ex_style & WS_EX_LAYERED)) ret = WSD_STYLE_BORDERLESS;
+    else
+    {
+        if (style & WS_SYSMENU) ret |= WSD_STYLE_CLOSABLE;
+        if (style & WS_MINIMIZEBOX) ret |= WSD_STYLE_MINIATURIZABLE;
+        if (style & WS_THICKFRAME) ret |= WSD_STYLE_RESIZABLE;
+    }
+    if (ex_style & WS_EX_TOPMOST) ret |= WSD_STYLE_TOPMOST;
+    if (ex_style & WS_EX_NOACTIVATE) ret |= WSD_STYLE_NOACTIVATE;
     return ret;
 }
 
@@ -460,9 +470,10 @@ static void OBELISK_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_h
     {
         if (!visible || !(win = alloc_win( hwnd ))) goto done;
     }
-    if (minimized && win->created && win->shown && (win->style & WSD_STYLE_MINIATURIZABLE))
+    if (minimized && win->created && win->shown)
     {
-        /* into the Dock; Wine's minimized position (off screen) is not given to wsd */
+        /* into the Dock, or out of sight for a window without a minimize button, which wsd brings back when the user
+         * comes back to the game; Wine's minimized position (off screen) is not given to wsd */
         if (!win->minimized)
             wsd_send( WSD_WINDOW_MINIMIZE, &(struct wsd_window_flag){ win_id( win ), 1 }, sizeof(struct wsd_window_flag), NULL, 0, -1 );
         win->minimized = TRUE;
@@ -509,7 +520,6 @@ static void OBELISK_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_h
         INT n = NtUserInternalGetWindowText( hwnd, textW, ARRAY_SIZE(textW) );
 
         if (n > 0) RtlUnicodeToUTF8N( title, sizeof(title), &len, textW, n * sizeof(WCHAR) );
-        if (ex_style & WS_EX_TOPMOST) create.style |= WSD_STYLE_TOPMOST;
         if (!wsd_send( WSD_WINDOW_CREATE, &create, sizeof(create), title, len, -1 )) goto done;
         win->created = TRUE;
         win->style = frame;
@@ -526,7 +536,9 @@ static void OBELISK_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_h
     }
     if (win->created && visible != win->shown)
     {
-        wsd_send( WSD_WINDOW_SHOW, &(struct wsd_window_flag){ win_id( win ), visible }, sizeof(struct wsd_window_flag), NULL, 0, -1 );
+        /* a window shown without activation (SW_SHOWNA, a menu, a tooltip) leaves the Mac's key window where it is */
+        UINT show = !visible ? 0 : (swp_flags & SWP_NOACTIVATE) || (ex_style & WS_EX_NOACTIVATE) ? 2 : 1;
+        wsd_send( WSD_WINDOW_SHOW, &(struct wsd_window_flag){ win_id( win ), show }, sizeof(struct wsd_window_flag), NULL, 0, -1 );
         win->shown = visible;
     }
     if (win->created && visible && fullscreen != win->fullscreen)
@@ -578,6 +590,15 @@ static LRESULT OBELISK_WindowMessage( HWND hwnd, UINT msg, WPARAM wparam, LPARAM
     case WM_OBELISK_APPLY_FRAME:
         apply_frame( hwnd );
         return 0;
+    case WM_OBELISK_TAKE_FOCUS:
+    {
+        /* The user made it the Mac's key window: it takes the foreground whatever process has it (Wine's foreground
+         * lock refused the event thread once the desktop had it), as winemac.drv's macdrv_window_got_focus gives it,
+         * in the window's thread. A window still minimized waits for the restore posted before this message. */
+        DWORD style = NtUserGetWindowLongW( hwnd, GWL_STYLE );
+        if ((style & WS_VISIBLE) && !(style & (WS_DISABLED | WS_MINIMIZE))) NtUserSetForegroundWindowInternal( hwnd );
+        return 0;
+    }
     }
     FIXME( "unknown driver message %#x hwnd %p\n", msg, hwnd );
     return 0;
@@ -607,12 +628,231 @@ static void OBELISK_SetWindowText( HWND hwnd, LPCWSTR text )
     pthread_mutex_unlock( &win_lock );
 }
 
+/* Wine activated the window: the Mac's key window follows, as winemac.drv gives it the focus in ActivateWindow. */
+static void OBELISK_ActivateWindow( HWND hwnd, HWND previous )
+{
+    struct obelisk_win *win;
+
+    pthread_mutex_lock( &win_lock );
+    if ((win = get_win( hwnd )) && win->created && win->shown)
+        wsd_send( WSD_WINDOW_FOCUS, &(struct wsd_window){ win_id( win ) }, sizeof(struct wsd_window), NULL, 0, -1 );
+    pthread_mutex_unlock( &win_lock );
+}
+
 /***********************************************************************
  *           cursor
  */
+
+/* The Mac cursors that stand for Windows' own (winemac.drv's table in mouse.c): the module and resource of a cursor
+ * Wine loaded from one of these modules. */
+static const struct { WCHAR module[16]; WORD id; UINT cursor; } system_cursors[] =
+{
+    { u"user32.dll",   OCR_NORMAL, WSD_CURSOR_ARROW },
+    { u"user32.dll",   OCR_IBEAM,  WSD_CURSOR_IBEAM },
+    { u"user32.dll",   OCR_CROSS,  WSD_CURSOR_CROSSHAIR },
+    { u"user32.dll",   OCR_SIZEWE, WSD_CURSOR_RESIZE_LEFT_RIGHT },
+    { u"user32.dll",   OCR_SIZENS, WSD_CURSOR_RESIZE_UP_DOWN },
+    { u"user32.dll",   OCR_NO,     WSD_CURSOR_NOT_ALLOWED },
+    { u"user32.dll",   OCR_HAND,   WSD_CURSOR_POINTING_HAND },
+    { u"comctl32.dll", 102,        WSD_CURSOR_CLOSED_HAND },
+    { u"comctl32.dll", 104,        WSD_CURSOR_DRAG_COPY },
+    { u"comctl32.dll", 105,        WSD_CURSOR_ARROW },
+    { u"comctl32.dll", 106,        WSD_CURSOR_RESIZE_LEFT_RIGHT },
+    { u"comctl32.dll", 107,        WSD_CURSOR_RESIZE_LEFT_RIGHT },
+    { u"comctl32.dll", 108,        WSD_CURSOR_POINTING_HAND },
+    { u"comctl32.dll", 135,        WSD_CURSOR_RESIZE_UP_DOWN },
+    { u"ole32.dll",    1,          WSD_CURSOR_NOT_ALLOWED },
+    { u"ole32.dll",    2,          WSD_CURSOR_CLOSED_HAND },
+    { u"ole32.dll",    3,          WSD_CURSOR_DRAG_COPY },
+    { u"ole32.dll",    4,          WSD_CURSOR_DRAG_LINK },
+    { u"riched20.dll", 105,        WSD_CURSOR_POINTING_HAND },
+    { u"riched20.dll", 109,        WSD_CURSOR_DRAG_COPY },
+    { u"riched20.dll", 110,        WSD_CURSOR_CLOSED_HAND },
+    { u"riched20.dll", 111,        WSD_CURSOR_NOT_ALLOWED },
+};
+
+#define CURSOR_CACHE 64  /* wsd keeps at most 64 cursor images per client */
+
+static pthread_mutex_t cursor_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct { HCURSOR handle; UINT cursor; } cursor_cache[CURSOR_CACHE];  /* cursor_lock held */
+static UINT cursor_cache_next;
+static HCURSOR current_cursor;
+
+/* The Mac cursor of a Windows system cursor, or -1. */
+static int system_cursor( const WCHAR *module, WORD id )
+{
+    const WCHAR *name = wcsrchr( module, '\\' ) ? wcsrchr( module, '\\' ) + 1 : module;
+    UINT i;
+
+    if (!id) return -1;  /* a named resource */
+    for (i = 0; i < ARRAY_SIZE(system_cursors); i++)
+        if (system_cursors[i].id == id && !wcsicmp( name, system_cursors[i].module )) return system_cursors[i].cursor;
+    return -1;
+}
+
+/* The cursor's first frame as BGRA pixels with straight alpha, drawn as winemac.drv draws it (image.c,
+ * create_cgimage_from_icon_bitmaps; mouse.c, create_monochrome_cursor): the color through DrawIconEx, with its alpha
+ * or else the AND mask's; a monochrome cursor from its AND and XOR masks, an inverting pixel shown black. */
+static UINT *cursor_pixels( HCURSOR cursor, const ICONINFO *info, UINT width, UINT height )
+{
+    char buffer[FIELD_OFFSET(BITMAPINFO, bmiColors[256])];
+    BITMAPINFO *bmi = (BITMAPINFO *)buffer;
+    UINT mask_stride = (width + 31) / 32 * 4, rows = info->hbmColor ? height : height * 2, x, y, i;
+    BYTE *mask = malloc( mask_stride * rows );
+    UINT *pixels = calloc( width * height, sizeof(UINT) ), *bits;
+    BOOL has_alpha = FALSE, ok = FALSE;
+    HBITMAP dib = 0;
+    HDC hdc = NtGdiCreateCompatibleDC( 0 );
+
+    if (!mask || !pixels || !hdc) goto done;
+    memset( bmi, 0, sizeof(buffer) );
+    bmi->bmiHeader.biSize = sizeof(bmi->bmiHeader);
+    bmi->bmiHeader.biWidth = width;
+    bmi->bmiHeader.biHeight = -(int)rows;
+    bmi->bmiHeader.biPlanes = 1;
+    bmi->bmiHeader.biBitCount = 1;
+    bmi->bmiHeader.biCompression = BI_RGB;
+    if (!NtGdiGetDIBitsInternal( hdc, info->hbmMask, 0, rows, mask, bmi, DIB_RGB_COLORS, 0, 0 )) goto done;
+
+    if (info->hbmColor)
+    {
+        bmi->bmiHeader.biHeight = -(int)height;
+        bmi->bmiHeader.biBitCount = 32;
+        if (!(dib = NtGdiCreateDIBSection( hdc, NULL, 0, bmi, DIB_RGB_COLORS, 0, 0, 0, (void **)&bits ))) goto done;
+        memset( bits, 0, width * height * 4 );
+        NtGdiSelectBitmap( hdc, dib );
+        if (!NtUserDrawIconEx( hdc, 0, 0, cursor, width, height, 0, NULL, DI_NORMAL )) goto done;
+        for (i = 0; i < width * height && !has_alpha; i++) has_alpha = (bits[i] & 0xff000000) != 0;
+        for (y = 0; y < height; y++)
+            for (x = 0; x < width; x++)
+            {
+                UINT p = bits[y * width + x], a = p >> 24;
+                if (!has_alpha)  /* AND mask: 1 leaves the screen as it is */
+                    pixels[y * width + x] = (mask[y * mask_stride + x / 8] & (0x80 >> (x % 8))) ? 0 : p | 0xff000000;
+                else if (a && a < 255)  /* DrawIconEx blends onto the zeroed bits: the colors come premultiplied */
+                    pixels[y * width + x] = (a << 24) | (min( 255, ((p >> 16) & 0xff) * 255 / a ) << 16) |
+                                            (min( 255, ((p >> 8) & 0xff) * 255 / a ) << 8) | min( 255, (p & 0xff) * 255 / a );
+                else pixels[y * width + x] = p;
+            }
+    }
+    else
+    {
+        for (y = 0; y < height; y++)
+            for (x = 0; x < width; x++)
+            {
+                BYTE bit = 0x80 >> (x % 8);
+                BOOL and_bit = !!(mask[y * mask_stride + x / 8] & bit), xor_bit = !!(mask[(y + height) * mask_stride + x / 8] & bit);
+                pixels[y * width + x] = (and_bit && !xor_bit) ? 0 : (and_bit ^ xor_bit) ? 0xffffffff : 0xff000000;
+            }
+    }
+    ok = TRUE;
+
+done:
+    if (dib) NtGdiDeleteObjectApp( dib );
+    if (hdc) NtGdiDeleteObjectApp( hdc );
+    free( mask );
+    if (!ok)
+    {
+        free( pixels );
+        pixels = NULL;
+    }
+    return pixels;
+}
+
+/* Gives wsd the cursor's image under the given id; FALSE when it cannot be shown (wsd shows the arrow). */
+static BOOL define_cursor( HCURSOR cursor, UINT id )
+{
+    WCHAR module_name[MAX_PATH], res_name[MAX_PATH];
+    UNICODE_STRING module = { 0, sizeof(module_name) - sizeof(WCHAR), module_name };
+    UNICODE_STRING res = { 0, sizeof(res_name) - sizeof(WCHAR), res_name };
+    struct wsd_cursor_define define = { id };
+    ICONINFO info;
+    BITMAP bm;
+    UINT *pixels = NULL;
+    BOOL ret = FALSE;
+    int fd = -1;
+
+    if (!NtUserGetIconInfo( cursor, &info, &module, &res, NULL, 0 )) return FALSE;
+    NtGdiExtGetObjectW( info.hbmMask, sizeof(bm), &bm );
+    define.width = bm.bmWidth;
+    define.height = info.hbmColor ? bm.bmHeight : max( 1, bm.bmHeight / 2 );
+    /* winemac.drv's rule: a hot spot outside the cursor is its center */
+    if (info.xHotspot >= define.width || info.yHotspot >= define.height)
+    {
+        info.xHotspot = define.width / 2;
+        info.yHotspot = define.height / 2;
+    }
+    define.hot_x = info.xHotspot;
+    define.hot_y = info.yHotspot;
+    define.stride = define.width * 4;
+    define.size = (UINT64)define.stride * define.height;
+    if (define.width && define.width <= 256 && define.height <= 256 &&
+        (pixels = cursor_pixels( cursor, &info, define.width, define.height )) &&
+        (fd = syscall( __NR_memfd_create, "wsd-cursor", 1 /* MFD_CLOEXEC */ )) >= 0 &&
+        pwrite( fd, pixels, define.size, 0 ) == (ssize_t)define.size)
+        ret = wsd_send( WSD_CURSOR_DEFINE, &define, sizeof(define), NULL, 0, fd );
+    if (fd >= 0) close( fd );
+    free( pixels );
+    if (info.hbmColor) NtGdiDeleteObjectApp( info.hbmColor );
+    NtGdiDeleteObjectApp( info.hbmMask );
+    TRACE( "cursor %p %ux%u hot spot %d,%d -> id %#x %d\n", cursor, define.width, define.height, define.hot_x,
+           define.hot_y, id, ret );
+    return ret;
+}
+
+/* The Mac cursor for a Windows one: the Mac's own for a system cursor, else its image, defined once (cursor_lock held). */
+static UINT mac_cursor( HCURSOR cursor )
+{
+    WCHAR module_name[MAX_PATH], res_name[MAX_PATH];
+    UNICODE_STRING module = { 0, sizeof(module_name) - sizeof(WCHAR), module_name };
+    UNICODE_STRING res = { 0, sizeof(res_name) - sizeof(WCHAR), res_name };
+    ICONINFO info;
+    UINT i, slot;
+    int sys = -1;
+
+    for (i = 0; i < CURSOR_CACHE; i++) if (cursor_cache[i].handle == cursor) return cursor_cache[i].cursor;
+    if (NtUserGetIconInfo( cursor, &info, &module, &res, NULL, 0 ))
+    {
+        module_name[module.Length] = 0;  /* win32u gives the lengths in characters */
+        sys = system_cursor( module_name, res.Length ? 0 : LOWORD( res.Buffer ));
+        TRACE( "cursor %p from %s %u -> Mac cursor %d\n", cursor, debugstr_w(module_name), LOWORD( res.Buffer ), sys );
+        if (info.hbmColor) NtGdiDeleteObjectApp( info.hbmColor );
+        NtGdiDeleteObjectApp( info.hbmMask );
+    }
+    /* never the slot of the cursor shown: wsd would show the new image in its place */
+    do slot = cursor_cache_next++ % CURSOR_CACHE; while (current_cursor && cursor_cache[slot].handle == current_cursor);
+    cursor_cache[slot].handle = cursor;
+    if (sys >= 0) cursor_cache[slot].cursor = sys;
+    else cursor_cache[slot].cursor = define_cursor( cursor, WSD_CURSOR_FIRST_DEFINED + slot )
+                                     ? WSD_CURSOR_FIRST_DEFINED + slot : WSD_CURSOR_ARROW;
+    return cursor_cache[slot].cursor;
+}
+
+static void OBELISK_DestroyCursorIcon( HCURSOR cursor )
+{
+    UINT i;
+
+    pthread_mutex_lock( &cursor_lock );
+    for (i = 0; i < CURSOR_CACHE; i++) if (cursor_cache[i].handle == cursor) cursor_cache[i].handle = 0;
+    if (current_cursor == cursor) current_cursor = 0;
+    pthread_mutex_unlock( &cursor_lock );
+}
+
 static void OBELISK_SetCursor( HWND hwnd, HCURSOR cursor )
 {
     BOOL visible = cursor != 0;
+
+    if (cursor)
+    {
+        pthread_mutex_lock( &cursor_lock );
+        if (cursor != current_cursor)
+        {
+            struct wsd_cursor_set set = { mac_cursor( cursor ) };
+            current_cursor = cursor;
+            wsd_send( WSD_CURSOR_SET, &set, sizeof(set), NULL, 0, -1 );
+        }
+        pthread_mutex_unlock( &cursor_lock );
+    }
     if (visible == cursor_visible) return;
     cursor_visible = visible;
     wsd_send( WSD_CURSOR_VISIBLE, &(struct wsd_window_flag){ 0, visible }, sizeof(struct wsd_window_flag), NULL, 0, -1 );
@@ -624,6 +864,16 @@ static void OBELISK_SetCursor( HWND hwnd, HCURSOR cursor )
         pthread_mutex_unlock( &win_lock );
         update_relative_mouse( id );
     }
+}
+
+/* SetCursorPos and the moves of SendInput: the Mac pointer follows (winemac.drv's SetCursorPos). In relative mode
+ * the pointer stands still and the game reads deltas. */
+static BOOL OBELISK_SetCursorPos( INT x, INT y )
+{
+    if (relative_window) return TRUE;
+    __atomic_store_n( &last_warp_ns, now_ns(), __ATOMIC_RELAXED );
+    TRACE( "warp to %d,%d\n", x, y );
+    return wsd_send( WSD_CURSOR_WARP, &(struct wsd_cursor_pos){ x, y }, sizeof(struct wsd_cursor_pos), NULL, 0, -1 );
 }
 
 static BOOL OBELISK_ClipCursor( const RECT *clip, BOOL reset )
@@ -663,6 +913,15 @@ static BOOL OBELISK_ClipCursor( const RECT *clip, BOOL reset )
     return TRUE;
 }
 
+/* SPI_SETSCREENSAVEACTIVE: while a game turns the screen saver off, the display stays on (winemac.drv's
+ * SystemParametersInfo); win32u keeps the value itself. */
+static BOOL OBELISK_SystemParametersInfo( UINT action, UINT int_param, void *ptr_param, UINT flags )
+{
+    if (action == SPI_SETSCREENSAVEACTIVE)
+        wsd_send( WSD_SCREEN_SAVER, &(struct wsd_window_flag){ 0, !!int_param }, sizeof(struct wsd_window_flag), NULL, 0, -1 );
+    return FALSE;
+}
+
 /***********************************************************************
  *           display devices
  */
@@ -673,8 +932,13 @@ static UINT OBELISK_UpdateDisplayDevices( const struct gdi_device_manager *manag
     struct pci_id pci_id = { 0 };
     struct gdi_monitor monitor = { 0 };
     DEVMODEW current = { .dmSize = sizeof(current) }, modes[ARRAY_SIZE(extra) + 1];
-    UINT i, count = 0, hz = hello.max_refresh_hz ? hello.max_refresh_hz : 60;
-    UINT width = hello.display_width_px, height = hello.display_height_px;
+    UINT i, count = 0, hz, width, height;
+
+    pthread_mutex_lock( &display_lock );
+    hz = hello.max_refresh_hz ? hello.max_refresh_hz : 60;
+    width = hello.display_width_px;
+    height = hello.display_height_px;
+    pthread_mutex_unlock( &display_lock );
 
     if (!width || !height) return STATUS_NOT_IMPLEMENTED;
 
@@ -710,40 +974,55 @@ static UINT OBELISK_UpdateDisplayDevices( const struct gdi_device_manager *manag
 /***********************************************************************
  *           input
  */
-static const struct { BYTE kvk; BYTE vk; WORD scan; } keymap[] =
+/* Mac virtual keycode -> virtual key and scan code (0x100: extended), by the key's place on a US keyboard: winemac.drv's
+ * table (keyboard.c, default_map), with Command as the Windows keys and Option as Alt. */
+static const struct { WORD vk; WORD scan; } keymap[128] =
 {
-    {0x00,'A',0x1e},{0x01,'S',0x1f},{0x02,'D',0x20},{0x03,'F',0x21},{0x04,'H',0x23},{0x05,'G',0x22},
-    {0x06,'Z',0x2c},{0x07,'X',0x2d},{0x08,'C',0x2e},{0x09,'V',0x2f},{0x0b,'B',0x30},{0x0c,'Q',0x10},
-    {0x0d,'W',0x11},{0x0e,'E',0x12},{0x0f,'R',0x13},{0x10,'Y',0x15},{0x11,'T',0x14},{0x12,'1',0x02},
-    {0x13,'2',0x03},{0x14,'3',0x04},{0x15,'4',0x05},{0x16,'6',0x07},{0x17,'5',0x06},{0x18,VK_OEM_PLUS,0x0d},
-    {0x19,'9',0x0a},{0x1a,'7',0x08},{0x1b,VK_OEM_MINUS,0x0c},{0x1c,'8',0x09},{0x1d,'0',0x0b},
-    {0x1e,VK_OEM_6,0x1b},{0x1f,'O',0x18},{0x20,'U',0x16},{0x21,VK_OEM_4,0x1a},{0x22,'I',0x17},{0x23,'P',0x19},
-    {0x24,VK_RETURN,0x1c},{0x25,'L',0x26},{0x26,'J',0x24},{0x27,VK_OEM_7,0x28},{0x28,'K',0x25},
-    {0x29,VK_OEM_1,0x27},{0x2a,VK_OEM_5,0x2b},{0x2b,VK_OEM_COMMA,0x33},{0x2c,VK_OEM_2,0x35},{0x2d,'N',0x31},
-    {0x2e,'M',0x32},{0x2f,VK_OEM_PERIOD,0x34},{0x30,VK_TAB,0x0f},{0x31,VK_SPACE,0x39},{0x32,VK_OEM_3,0x29},
-    {0x33,VK_BACK,0x0e},{0x35,VK_ESCAPE,0x01},{0x36,VK_RWIN,0x15c},{0x37,VK_LWIN,0x15b},{0x38,VK_LSHIFT,0x2a},
-    {0x39,VK_CAPITAL,0x3a},{0x3a,VK_LMENU,0x38},{0x3b,VK_LCONTROL,0x1d},{0x3c,VK_RSHIFT,0x36},
-    {0x3d,VK_RMENU,0x138},{0x3e,VK_RCONTROL,0x11d},{0x60,VK_F5,0x3f},{0x61,VK_F6,0x40},{0x62,VK_F7,0x41},
-    {0x63,VK_F3,0x3d},{0x64,VK_F8,0x42},{0x65,VK_F9,0x43},{0x67,VK_F11,0x57},{0x6d,VK_F10,0x44},
-    {0x6f,VK_F12,0x58},{0x73,VK_HOME,0x147},{0x74,VK_PRIOR,0x149},{0x75,VK_DELETE,0x153},{0x76,VK_F4,0x3e},
-    {0x77,VK_END,0x14f},{0x78,VK_F2,0x3c},{0x79,VK_NEXT,0x151},{0x7a,VK_F1,0x3b},{0x7b,VK_LEFT,0x14b},
-    {0x7c,VK_RIGHT,0x14d},{0x7d,VK_DOWN,0x150},{0x7e,VK_UP,0x148},
+    {'A',0x1e},{'S',0x1f},{'D',0x20},{'F',0x21},{'H',0x23},{'G',0x22},{'Z',0x2c},{'X',0x2d},          /* 0x00 */
+    {'C',0x2e},{'V',0x2f},{VK_OEM_102,0x56},{'B',0x30},{'Q',0x10},{'W',0x11},{'E',0x12},{'R',0x13},  /* 0x08 */
+    {'Y',0x15},{'T',0x14},{'1',0x02},{'2',0x03},{'3',0x04},{'4',0x05},{'6',0x07},{'5',0x06},          /* 0x10 */
+    {VK_OEM_PLUS,0x0d},{'9',0x0a},{'7',0x08},{VK_OEM_MINUS,0x0c},{'8',0x09},{'0',0x0b},{VK_OEM_6,0x1b},{'O',0x18}, /* 0x18 */
+    {'U',0x16},{VK_OEM_4,0x1a},{'I',0x17},{'P',0x19},{VK_RETURN,0x1c},{'L',0x26},{'J',0x24},{VK_OEM_7,0x28}, /* 0x20 */
+    {'K',0x25},{VK_OEM_1,0x27},{VK_OEM_5,0x2b},{VK_OEM_COMMA,0x33},{VK_OEM_2,0x35},{'N',0x31},{'M',0x32},
+    {VK_OEM_PERIOD,0x34},                                                                              /* 0x28 */
+    {VK_TAB,0x0f},{VK_SPACE,0x39},{VK_OEM_3,0x29},{VK_BACK,0x0e},{0,0},{VK_ESCAPE,0x01},{VK_RWIN,0x15c},
+    {VK_LWIN,0x15b},                                                                                   /* 0x30 */
+    {VK_LSHIFT,0x2a},{VK_CAPITAL,0x3a},{VK_LMENU,0x38},{VK_LCONTROL,0x1d},{VK_RSHIFT,0x36},{VK_RMENU,0x138},
+    {VK_RCONTROL,0x11d},{0,0} /* Fn */,                                                                 /* 0x38 */
+    {VK_F17,0x68},{VK_DECIMAL,0x53},{0,0},{VK_MULTIPLY,0x37},{0,0},{VK_ADD,0x4e},{0,0},{VK_OEM_CLEAR,0x59}, /* 0x40 */
+    {VK_VOLUME_UP,0x100},{VK_VOLUME_DOWN,0x100},{VK_VOLUME_MUTE,0x100},{VK_DIVIDE,0x135},{VK_RETURN,0x11c},
+    {0,0},{VK_SUBTRACT,0x4a},{VK_F18,0x69},                                                            /* 0x48 */
+    {VK_F19,0x6a},{VK_OEM_NEC_EQUAL,0x10d},{VK_NUMPAD0,0x52},{VK_NUMPAD1,0x4f},{VK_NUMPAD2,0x50},{VK_NUMPAD3,0x51},
+    {VK_NUMPAD4,0x4b},{VK_NUMPAD5,0x4c},                                                               /* 0x50 */
+    {VK_NUMPAD6,0x4d},{VK_NUMPAD7,0x47},{VK_F20,0x6b},{VK_NUMPAD8,0x48},{VK_NUMPAD9,0x49},{0xff,0x7d} /* JIS Yen */,
+    {0xc1,0x73} /* JIS Underscore */,{VK_SEPARATOR,0x7e} /* JIS Keypad Comma */,                        /* 0x58 */
+    {VK_F5,0x3f},{VK_F6,0x40},{VK_F7,0x41},{VK_F3,0x3d},{VK_F8,0x42},{VK_F9,0x43},{0xff,0x72} /* JIS Eisu */,
+    {VK_F11,0x57},                                                                                     /* 0x60 */
+    {VK_OEM_RESET,0x71} /* JIS Kana */,{VK_F13,0x64},{VK_F16,0x67},{VK_F14,0x65},{0,0},{VK_F10,0x44},{0,0},
+    {VK_F12,0x58},                                                                                     /* 0x68 */
+    {0,0},{VK_F15,0x66},{VK_INSERT,0x152} /* Help */,{VK_HOME,0x147},{VK_PRIOR,0x149},{VK_DELETE,0x153},
+    {VK_F4,0x3e},{VK_END,0x14f},                                                                       /* 0x70 */
+    {VK_F2,0x3c},{VK_NEXT,0x151},{VK_F1,0x3b},{VK_LEFT,0x14b},{VK_RIGHT,0x14d},{VK_DOWN,0x150},{VK_UP,0x148},
+    {0,0},                                                                                             /* 0x78 */
 };
 
 static void send_key( HWND hwnd, const struct wsd_ev_key *ev )
 {
     INPUT input = { .type = INPUT_KEYBOARD };
-    UINT i;
+    UINT code = ev->mac_keycode;
 
-    for (i = 0; i < ARRAY_SIZE(keymap); i++) if (keymap[i].kvk == ev->mac_keycode) break;
-    if (i == ARRAY_SIZE(keymap))
+    /* On an ISO keyboard kVK_ISO_Section is the key left of 1 and kVK_ANSI_Grave the one right of the left Shift:
+     * each takes the other's Windows key, so that a key keeps its scan code wherever it is (winemac.drv swaps their
+     * scan codes the same way). */
+    if ((ev->flags & WSD_KEY_ISO) && (code == 0x0a || code == 0x32)) code ^= 0x0a ^ 0x32;
+    if (code >= ARRAY_SIZE(keymap) || !keymap[code].vk)
     {
         TRACE( "unmapped mac keycode %#x\n", ev->mac_keycode );
         return;
     }
-    input.ki.wVk = keymap[i].vk;
-    input.ki.wScan = keymap[i].scan & 0xff;
-    if (keymap[i].scan & 0x100) input.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
+    input.ki.wVk = keymap[code].vk;
+    input.ki.wScan = keymap[code].scan & 0xff;
+    if (keymap[code].scan & 0x100) input.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
     if (!(ev->flags & WSD_KEY_DOWN)) input.ki.dwFlags |= KEYEVENTF_KEYUP;
     TRACE( "hwnd %p kvk %#x vk %#x flags %#x\n", hwnd, ev->mac_keycode, input.ki.wVk, input.ki.dwFlags );
     NtUserSendHardwareInput( hwnd, 0, &input, 0 );
@@ -768,7 +1047,8 @@ static void handle_event( const struct wsd_hdr *hdr, const char *payload )
     HWND hwnd = 0;
     RECT visible = { 0 };
 
-    if (hdr->type != WSD_EV_RELEASE && hdr->type != WSD_EV_PRESENTED && hdr->type != WSD_EV_ERROR && hdr->len >= 4)
+    if (hdr->type != WSD_EV_RELEASE && hdr->type != WSD_EV_PRESENTED && hdr->type != WSD_EV_ERROR &&
+        hdr->type != WSD_EV_DISPLAY && hdr->len >= 4)
     {
         pthread_mutex_lock( &win_lock );
         if ((win = get_win_by_id( w->window_id )))
@@ -816,6 +1096,8 @@ static void handle_event( const struct wsd_hdr *hdr, const char *payload )
     case WSD_EV_MOTION:
     {
         const struct wsd_ev_motion *ev = (const void *)payload;
+        /* sent before the last SetCursorPos: Wine's cursor would go back where the game moved it from */
+        if (ev->time_ns <= __atomic_load_n( &last_warp_ns, __ATOMIC_RELAXED )) break;
         if (hwnd) send_mouse( hwnd, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
                               visible.left + (int)ev->x, visible.top + (int)ev->y, 0 );
         break;
@@ -869,7 +1151,7 @@ static void handle_event( const struct wsd_hdr *hdr, const char *payload )
     {
         const struct wsd_window_flag *ev = (const void *)payload;
         TRACE( "focus %u hwnd %p\n", ev->value, hwnd );
-        if (hwnd && ev->value) NtUserSetForegroundWindow( hwnd );
+        if (hwnd && ev->value) NtUserPostMessage( hwnd, WM_OBELISK_TAKE_FOCUS, 0, 0 );
         break;
     }
     case WSD_EV_CLOSE:
@@ -903,6 +1185,8 @@ static void handle_event( const struct wsd_hdr *hdr, const char *payload )
         pthread_mutex_unlock( &win_lock );
         TRACE( "hwnd %p minimized %u by the user (changed %u)\n", hwnd, ev->value, changed );
         if (hwnd && changed) NtUserPostMessage( hwnd, WM_SYSCOMMAND, ev->value ? SC_MINIMIZE : SC_RESTORE, 0 );
+        /* restored by the user, as from the taskbar on Windows: the window takes the focus once restored */
+        if (hwnd && changed && !ev->value) NtUserPostMessage( hwnd, WM_OBELISK_TAKE_FOCUS, 0, 0 );
         break;
     }
     case WSD_EV_ZOOM:
@@ -916,6 +1200,34 @@ static void handle_event( const struct wsd_hdr *hdr, const char *payload )
     {
         const struct wsd_ev_resize *ev = (const void *)payload;
         TRACE( "hwnd %p resized to %ux%u\n", hwnd, ev->width_px, ev->height_px );
+        break;
+    }
+    case WSD_EV_APP_DEACTIVATED:
+    {
+        HWND foreground = NtUserGetForegroundWindow();
+        DWORD pid = 0;
+        /* Another Mac app is in front: the game goes to the background as winemac.drv sends it there
+         * (macdrv_app_deactivated), the desktop taking the foreground, and gets WM_ACTIVATEAPP. The process that has
+         * the foreground does it. */
+        if (!foreground || !NtUserGetWindowThread( foreground, &pid ) || pid != GetCurrentProcessId()) break;
+        TRACE( "app deactivated, foreground %p to the desktop\n", foreground );
+        NtUserClipCursor( NULL );
+        NtUserSetForegroundWindowInternal( NtUserGetDesktopWindow() );
+        break;
+    }
+    case WSD_EV_DISPLAY:
+    {
+        struct wsd_hello_reply display = { 0 };
+        DWORD pid = 0;
+        memcpy( &display, payload, min( hdr->len, sizeof(display) ));
+        pthread_mutex_lock( &display_lock );
+        hello = display;
+        pthread_mutex_unlock( &display_lock );
+        TRACE( "display now %ux%u @%u Hz\n", display.display_width_px, display.display_height_px, display.max_refresh_hz );
+        /* Each process keeps the new size; the desktop's tells Wine, which asks UpdateDisplayDevices again
+         * (winemac.drv's macdrv_displays_changed). */
+        NtUserGetWindowThread( NtUserGetDesktopWindow(), &pid );
+        if (pid == GetCurrentProcessId()) NtUserCallNoParam( NtUserCallNoParam_DisplayModeChanged );
         break;
     }
     case WSD_EV_ERROR:
@@ -980,11 +1292,17 @@ OBELISK_EXPORT void obelisk_wsd_set_external( UINT window_id, BOOL external )
 
 OBELISK_EXPORT BOOL obelisk_wsd_get_display( UINT *width, UINT *height, UINT *refresh_hz )
 {
-    if (!hello.display_width_px) return FALSE;
-    *width = hello.display_width_px;
-    *height = hello.display_height_px;
-    *refresh_hz = hello.max_refresh_hz ? hello.max_refresh_hz : 60;
-    return TRUE;
+    BOOL ret;
+
+    pthread_mutex_lock( &display_lock );
+    if ((ret = hello.display_width_px != 0))
+    {
+        *width = hello.display_width_px;
+        *height = hello.display_height_px;
+        *refresh_hz = hello.max_refresh_hz ? hello.max_refresh_hz : 60;
+    }
+    pthread_mutex_unlock( &display_lock );
+    return ret;
 }
 
 OBELISK_EXPORT UINT64 obelisk_wsd_next_serial(void)
@@ -997,12 +1315,16 @@ OBELISK_EXPORT UINT64 obelisk_wsd_next_serial(void)
  */
 static const struct user_driver_funcs obeliskdrv_funcs =
 {
+    .pActivateWindow = OBELISK_ActivateWindow,
     .pClipCursor = OBELISK_ClipCursor,
     .pCreateWindowSurface = OBELISK_CreateWindowSurface,
+    .pDestroyCursorIcon = OBELISK_DestroyCursorIcon,
     .pDestroyWindow = OBELISK_DestroyWindow,
     .pGetWindowStyleMasks = OBELISK_GetWindowStyleMasks,
     .pSetCursor = OBELISK_SetCursor,
+    .pSetCursorPos = OBELISK_SetCursorPos,
     .pSetWindowText = OBELISK_SetWindowText,
+    .pSystemParametersInfo = OBELISK_SystemParametersInfo,
     .pUpdateDisplayDevices = OBELISK_UpdateDisplayDevices,
     .pWindowMessage = OBELISK_WindowMessage,
     .pWindowPosChanged = OBELISK_WindowPosChanged,
