@@ -1,5 +1,6 @@
 /*
- * Obelisk audio driver (unixlib): WASAPI render streams played by the Obelisk window server (wsd) on macOS.
+ * Obelisk audio driver (unixlib): WASAPI render streams played, and capture streams recorded, by the Obelisk window
+ * server (wsd) on macOS.
  *
  * Copyright 2011 Andrew Eikum for CodeWeavers
  *           2022 Huw Davies
@@ -9,6 +10,8 @@
  * replaced by a ring of frames shared with wsd (a memfd, struct wsd_audio_ring in wsd_protocol.h). The timer loop
  * copies the frames the application released into the ring; wsd's CoreAudio render callback consumes them and
  * publishes how far it has read, which drives the padding and the position like GETOSPACE does for OSS.
+ * A capture stream is the same ring the other way round: wsd's CoreAudio input callback fills it, and the timer loop
+ * copies the frames into the local buffer like the OSS driver reads its device.
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -70,7 +73,8 @@ struct obelisk_stream
     void *map;
     SIZE_T map_len;
     UINT32 ring_frames;
-    UINT64 ring_written; /* frames published to the ring (ring->write_frames) */
+    UINT64 ring_written; /* render: frames published to the ring (ring->write_frames) */
+    UINT64 ring_read;    /* capture: frames taken from the ring (ring->read_frames) */
 
     BOOL playing, mute, please_quit;
     UINT64 written_frames, last_pos_frames;
@@ -87,6 +91,7 @@ struct obelisk_stream
 static const REFERENCE_TIME def_period = 100000;
 static const REFERENCE_TIME min_period = 50000;
 static const char device_name[] = "wsd";
+static const char device_name_input[] = "wsd-input";
 
 static ULONG_PTR zero_bits = 0;
 
@@ -333,22 +338,25 @@ static NTSTATUS obelisk_main_loop(void *args)
 
 static NTSTATUS obelisk_get_endpoint_ids(void *args)
 {
-    static const WCHAR name[] = {'S','p','e','a','k','e','r','s',' ','(','m','a','c','O','S',')',0};
+    static const WCHAR speakers[] = {'S','p','e','a','k','e','r','s',' ','(','m','a','c','O','S',')',0};
+    static const WCHAR microphone[] = {'M','i','c','r','o','p','h','o','n','e',' ','(','m','a','c','O','S',')',0};
     struct get_endpoint_ids_params *params = args;
+    const WCHAR *name = params->flow == eCapture ? microphone : speakers;
+    const char *device = params->flow == eCapture ? device_name_input : device_name;
+    SIZE_T name_size = params->flow == eCapture ? sizeof(microphone) : sizeof(speakers);
     unsigned int needed, offset;
     struct endpoint *endpoint = params->endpoints;
 
     params->default_idx = 0;
-    if (params->flow != eRender)
+    if (params->flow != eRender && params->flow != eCapture)
     {
-        /* no capture device yet */
         params->num = 0;
         params->result = S_OK;
         return STATUS_SUCCESS;
     }
 
     offset = sizeof(*endpoint);
-    needed = offset + sizeof(name) + ((sizeof(device_name) + 1) & ~1);
+    needed = offset + name_size + ((strlen(device) + 2) & ~1);
     params->num = 1;
     if (needed > params->size)
     {
@@ -357,10 +365,10 @@ static NTSTATUS obelisk_get_endpoint_ids(void *args)
         return STATUS_SUCCESS;
     }
     endpoint->name = offset;
-    memcpy((char *)params->endpoints + offset, name, sizeof(name));
-    offset += sizeof(name);
+    memcpy((char *)params->endpoints + offset, name, name_size);
+    offset += name_size;
     endpoint->device = offset;
-    memcpy((char *)params->endpoints + offset, device_name, sizeof(device_name));
+    strcpy((char *)params->endpoints + offset, device);
     params->result = S_OK;
     return STATUS_SUCCESS;
 }
@@ -511,7 +519,7 @@ static HRESULT open_ring(struct obelisk_stream *stream)
     o.ring_frames = stream->ring_frames;
     o.offset = 0;
     o.size = size;
-    if(!wsd_request_sync(WSD_AUDIO_OPEN, &o, sizeof(o), fd)){
+    if(!wsd_request_sync(stream->flow == eCapture ? WSD_AUDIO_OPEN_INPUT : WSD_AUDIO_OPEN, &o, sizeof(o), fd)){
         close(fd);
         return AUDCLNT_E_DEVICE_INVALIDATED;
     }
@@ -535,7 +543,7 @@ static NTSTATUS obelisk_create_stream(void *args)
     struct obelisk_stream *stream;
     SIZE_T size;
 
-    if(params->flow != eRender){
+    if(params->flow != eRender && params->flow != eCapture){
         params->result = AUDCLNT_E_DEVICE_INVALIDATED;
         return STATUS_SUCCESS;
     }
@@ -676,8 +684,14 @@ static NTSTATUS obelisk_reset(void *args)
     if(stream->getbuf_last)
         return obelisk_unlock_result(stream, &params->result, AUDCLNT_E_BUFFER_OPERATION_PENDING);
 
-    /* drop what wsd has not played: its read position jumps to our write position */
-    stream_command(stream, WSD_AUDIO_RESET);
+    if(stream->flow == eCapture){
+        /* drop what wsd recorded: we own the read position */
+        stream->ring_read = atomic_load_explicit((_Atomic UINT64 *)&stream->ring->write_frames, memory_order_acquire);
+        atomic_store_explicit((_Atomic UINT64 *)&stream->ring->read_frames, stream->ring_read, memory_order_release);
+    }else{
+        /* drop what wsd has not played: its read position jumps to our write position */
+        stream_command(stream, WSD_AUDIO_RESET);
+    }
     stream->written_frames = 0;
     stream->last_pos_frames = 0;
     stream->held_frames = 0;
@@ -768,6 +782,30 @@ static void obelisk_write_data(struct obelisk_stream *stream)
     atomic_store_explicit((_Atomic UINT64 *)&stream->ring->write_frames, stream->ring_written, memory_order_release);
 }
 
+/* copy the frames wsd recorded into the local buffer; when the application is too slow the oldest are overwritten */
+static void obelisk_read_data(struct obelisk_stream *stream)
+{
+    UINT32 block = stream->fmt->nBlockAlign;
+    UINT64 written = atomic_load_explicit((_Atomic UINT64 *)&stream->ring->write_frames, memory_order_acquire);
+
+    while(written > stream->ring_read){
+        UINT32 ring_pos = stream->ring_read % stream->ring_frames;
+        UINT32 pos = (stream->lcl_offs_frames + stream->held_frames) % stream->bufsize_frames;
+        UINT32 n = min(min(written - stream->ring_read, stream->ring_frames - ring_pos), stream->bufsize_frames - pos);
+
+        memcpy(stream->local_buffer + (SIZE_T)pos * block, stream->ring_data + (SIZE_T)ring_pos * block, (SIZE_T)n * block);
+        stream->ring_read += n;
+        stream->held_frames += n;
+        if(stream->held_frames > stream->bufsize_frames){
+            WARN("Overflow of unread data\n");
+            stream->lcl_offs_frames = (stream->lcl_offs_frames + stream->held_frames - stream->bufsize_frames) %
+                                      stream->bufsize_frames;
+            stream->held_frames = stream->bufsize_frames;
+        }
+    }
+    atomic_store_explicit((_Atomic UINT64 *)&stream->ring->read_frames, stream->ring_read, memory_order_release);
+}
+
 static NTSTATUS obelisk_timer_loop(void *args)
 {
     struct timer_loop_params *params = args;
@@ -782,8 +820,12 @@ static NTSTATUS obelisk_timer_loop(void *args)
     next.QuadPart = now.QuadPart + stream->period;
 
     while(!stream->please_quit){
-        if(stream->playing && stream->held_frames)
-            obelisk_write_data(stream);
+        if(stream->playing){
+            if(stream->flow == eRender && stream->held_frames)
+                obelisk_write_data(stream);
+            else if(stream->flow == eCapture)
+                obelisk_read_data(stream);
+        }
         if(stream->event)
             NtSetEvent(stream->event, NULL);
         obelisk_unlock(stream);
@@ -920,23 +962,100 @@ static NTSTATUS obelisk_release_render_buffer(void *args)
 static NTSTATUS obelisk_get_capture_buffer(void *args)
 {
     struct get_capture_buffer_params *params = args;
-    params->result = AUDCLNT_E_WRONG_ENDPOINT_TYPE;
-    return STATUS_SUCCESS;
+    struct obelisk_stream *stream = handle_get_stream(params->stream);
+    UINT64 *devpos = params->devpos, *qpcpos = params->qpcpos;
+    UINT32 *frames = params->frames;
+    UINT *flags = params->flags;
+    BYTE **data = params->data;
+    SIZE_T size;
+
+    obelisk_lock(stream);
+
+    if(stream->getbuf_last)
+        return obelisk_unlock_result(stream, &params->result, AUDCLNT_E_OUT_OF_ORDER);
+
+    if(stream->held_frames < stream->period_frames){
+        *frames = 0;
+        return obelisk_unlock_result(stream, &params->result, AUDCLNT_S_BUFFER_EMPTY);
+    }
+
+    *flags = 0;
+
+    *frames = stream->period_frames;
+
+    if(stream->lcl_offs_frames + *frames > stream->bufsize_frames){
+        UINT32 chunk_bytes, offs_bytes, frames_bytes;
+        if(stream->tmp_buffer_frames < *frames){
+            if(stream->tmp_buffer){
+                size = 0;
+                NtFreeVirtualMemory(GetCurrentProcess(), (void **)&stream->tmp_buffer, &size, MEM_RELEASE);
+                stream->tmp_buffer = NULL;
+            }
+            size = *frames * stream->fmt->nBlockAlign;
+            if(NtAllocateVirtualMemory(GetCurrentProcess(), (void **)&stream->tmp_buffer, zero_bits,
+                                       &size, MEM_COMMIT, PAGE_READWRITE)){
+                stream->tmp_buffer_frames = 0;
+                return obelisk_unlock_result(stream, &params->result, E_OUTOFMEMORY);
+            }
+            stream->tmp_buffer_frames = *frames;
+        }
+
+        *data = stream->tmp_buffer;
+        chunk_bytes = (stream->bufsize_frames - stream->lcl_offs_frames) * stream->fmt->nBlockAlign;
+        offs_bytes = stream->lcl_offs_frames * stream->fmt->nBlockAlign;
+        frames_bytes = *frames * stream->fmt->nBlockAlign;
+        memcpy(stream->tmp_buffer, stream->local_buffer + offs_bytes, chunk_bytes);
+        memcpy(stream->tmp_buffer + chunk_bytes, stream->local_buffer, frames_bytes - chunk_bytes);
+    }else
+        *data = stream->local_buffer + stream->lcl_offs_frames * stream->fmt->nBlockAlign;
+
+    stream->getbuf_last = *frames;
+
+    if(devpos)
+        *devpos = stream->written_frames;
+    if(qpcpos){
+        LARGE_INTEGER stamp, freq;
+        NtQueryPerformanceCounter(&stamp, &freq);
+        *qpcpos = (stamp.QuadPart * (INT64)10000000) / freq.QuadPart;
+    }
+
+    return obelisk_unlock_result(stream, &params->result, S_OK);
 }
 
 static NTSTATUS obelisk_release_capture_buffer(void *args)
 {
     struct release_capture_buffer_params *params = args;
-    params->result = AUDCLNT_E_WRONG_ENDPOINT_TYPE;
-    return STATUS_SUCCESS;
+    struct obelisk_stream *stream = handle_get_stream(params->stream);
+    UINT32 done = params->done;
+
+    obelisk_lock(stream);
+
+    if(!done){
+        stream->getbuf_last = 0;
+        return obelisk_unlock_result(stream, &params->result, S_OK);
+    }
+
+    if(!stream->getbuf_last)
+        return obelisk_unlock_result(stream, &params->result, AUDCLNT_E_OUT_OF_ORDER);
+
+    if(stream->getbuf_last != done)
+        return obelisk_unlock_result(stream, &params->result, AUDCLNT_E_INVALID_SIZE);
+
+    stream->written_frames += done;
+    stream->held_frames -= done;
+    stream->lcl_offs_frames += done;
+    stream->lcl_offs_frames %= stream->bufsize_frames;
+    stream->getbuf_last = 0;
+
+    return obelisk_unlock_result(stream, &params->result, S_OK);
 }
 
 static NTSTATUS obelisk_is_format_supported(void *args)
 {
     struct is_format_supported_params *params = args;
 
-    params->result = params->flow == eRender ? check_format(params->share, params->fmt_in)
-                                             : AUDCLNT_E_DEVICE_INVALIDATED;
+    params->result = params->flow == eRender || params->flow == eCapture ? check_format(params->share, params->fmt_in)
+                                                                         : AUDCLNT_E_DEVICE_INVALIDATED;
     return STATUS_SUCCESS;
 }
 
@@ -945,16 +1064,17 @@ static NTSTATUS obelisk_get_mix_format(void *args)
     struct get_mix_format_params *params = args;
     WAVEFORMATEXTENSIBLE *fmt = params->fmt;
 
-    if(params->flow != eRender){
-        params->result = params->flow == eCapture ? AUDCLNT_E_DEVICE_INVALIDATED : E_UNEXPECTED;
+    if(params->flow != eRender && params->flow != eCapture){
+        params->result = E_UNEXPECTED;
         return STATUS_SUCCESS;
     }
 
-    /* what a Mac (and most Windows machines) mix in: 32-bit float stereo at 48 kHz */
+    /* what a Mac (and most Windows machines) mix in: 32-bit float stereo at 48 kHz; a microphone is mono, and wsd
+     * converts whatever its device records to the format the stream asks for */
     fmt->Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
     fmt->Format.wBitsPerSample = 32;
     fmt->SubFormat = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
-    fmt->Format.nChannels = 2;
+    fmt->Format.nChannels = params->flow == eCapture ? 1 : 2;
     fmt->Format.nSamplesPerSec = 48000;
     fmt->dwChannelMask = get_channel_mask(fmt->Format.nChannels);
     fmt->Format.nBlockAlign = (fmt->Format.wBitsPerSample * fmt->Format.nChannels) / 8;
@@ -1061,10 +1181,15 @@ static NTSTATUS obelisk_get_position(void *args)
 
     obelisk_lock(stream);
 
-    /* held_frames still counts what wsd has not read from the ring: the difference is what was played */
-    *pos = stream->written_frames - stream->held_frames;
-    if(*pos < stream->last_pos_frames)
-        *pos = stream->last_pos_frames;
+    if(stream->flow == eCapture){
+        /* what the application took plus what waits in the local buffer */
+        *pos = stream->written_frames + stream->held_frames;
+    }else{
+        /* held_frames still counts what wsd has not read from the ring: the difference is what was played */
+        *pos = stream->written_frames - stream->held_frames;
+        if(*pos < stream->last_pos_frames)
+            *pos = stream->last_pos_frames;
+    }
 
     stream->last_pos_frames = *pos;
 
