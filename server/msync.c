@@ -177,7 +177,12 @@ static inline struct tid_node *pool_alloc(void)
 {
     if (pool->count == 0)
     {
-        fprintf( stderr, "msync: warn: node memory pool exhausted\n" );
+        static int warned;
+        if (!warned)
+        {
+            warned = 1;
+            fprintf( stderr, "msync: warn: node memory pool exhausted\n" );
+        }
         return malloc( sizeof(struct tid_node) );
     }
     return pool->free_nodes[--pool->count];
@@ -508,7 +513,7 @@ static void *mach_message_pump( void *args )
             val = __atomic_load_n( &obj->low, __ATOMIC_SEQ_CST );
             if ((is_mutex && (val == 0 || val == ~0 || val == tid)) || (!is_mutex && val != 0))
             {
-                if (i > 1) unregister_wait( &receive_message, tid, i );
+                if (i > 0) unregister_wait( &receive_message, tid, i );
                 wake_tid( tid );
                 break;
             }

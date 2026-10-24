@@ -255,8 +255,9 @@ static inline mach_msg_return_t server_register_wait( unsigned int msgh_id, cons
     return mr;
 }
 
+/* drop_waiters: also take this wait out of the objects' multiple_waiters counts */
 static inline void server_remove_wait( unsigned int msgh_id, const int *objs, void **objs_shm,
-                                       int alert_obj, void *alert_obj_shm, int count )
+                                       int alert_obj, void *alert_obj_shm, int count, BOOL drop_waiters )
 {
     int i;
     mach_msg_return_t mr;
@@ -270,9 +271,12 @@ static inline void server_remove_wait( unsigned int msgh_id, const int *objs, vo
     {
         struct event *obj = (struct event *)objs_shm[i];
 
-        int refs = __atomic_sub_fetch( &obj->multiple_waiters, 1, __ATOMIC_SEQ_CST);
-        if (refs < 0)
-            __atomic_store_n( &obj->multiple_waiters, 0, __ATOMIC_SEQ_CST);
+        if (drop_waiters)
+        {
+            int refs = __atomic_sub_fetch( &obj->multiple_waiters, 1, __ATOMIC_SEQ_CST);
+            if (refs < 0)
+                __atomic_store_n( &obj->multiple_waiters, 0, __ATOMIC_SEQ_CST);
+        }
         message.shm_idx[i] = objs[i];
     }
 
@@ -280,9 +284,12 @@ static inline void server_remove_wait( unsigned int msgh_id, const int *objs, vo
     {
         struct event *obj = (struct event *)alert_obj_shm;
 
-        int refs = __atomic_sub_fetch( &obj->multiple_waiters, 1, __ATOMIC_SEQ_CST);
-        if (refs < 0)
-            __atomic_store_n( &obj->multiple_waiters, 0, __ATOMIC_SEQ_CST);
+        if (drop_waiters)
+        {
+            int refs = __atomic_sub_fetch( &obj->multiple_waiters, 1, __ATOMIC_SEQ_CST);
+            if (refs < 0)
+                __atomic_store_n( &obj->multiple_waiters, 0, __ATOMIC_SEQ_CST);
+        }
         message.shm_idx[count++] = alert_obj;
     }
 
@@ -386,6 +393,10 @@ static NTSTATUS msync_wait_multiple( const int *objs, void **objs_shm, int alert
                 if (refs < 0)
                     __atomic_store_n( &obj->multiple_waiters, 0, __ATOMIC_SEQ_CST);
             }
+            /* The server may register this wait after we leave it (the object we saw signaled can be taken by
+             * then): unregister it, behind the registration in the port's queue, or it stays on the objects'
+             * lists for good. */
+            server_remove_wait( msgh_id, objs, objs_shm, alert_obj, alert_obj_shm, count, FALSE );
             return STATUS_PENDING;
         }
     }
@@ -397,7 +408,7 @@ static NTSTATUS msync_wait_multiple( const int *objs, void **objs_shm, int alert
             ns_timeleft = update_timeout( *end ) * 100;
             if (!ns_timeleft)
             {
-                server_remove_wait( msgh_id, objs, objs_shm, alert_obj, alert_obj_shm, count );
+                server_remove_wait( msgh_id, objs, objs_shm, alert_obj, alert_obj_shm, count, TRUE );
                 return STATUS_TIMEOUT;
             }
         }
@@ -407,7 +418,7 @@ static NTSTATUS msync_wait_multiple( const int *objs, void **objs_shm, int alert
             break;
     } while (ret == -EINTR || ret == -EFAULT);
 
-    server_remove_wait( msgh_id, objs, objs_shm, alert_obj, alert_obj_shm, count );
+    server_remove_wait( msgh_id, objs, objs_shm, alert_obj, alert_obj_shm, count, TRUE );
 
     if (ret == -ETIMEDOUT) return STATUS_TIMEOUT;
 
