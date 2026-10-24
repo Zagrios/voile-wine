@@ -393,6 +393,9 @@ DECL_HANDLER(create_event)
         else
             reply->handle = alloc_handle_no_access_check( current->process, event,
                                                           req->access, objattr->attributes );
+        if (reply->handle &&
+            (reply->inproc_type = send_inproc_sync( current->process, &event->obj, reply->handle, &reply->shm_idx )))
+            reply->access = get_handle_access( current->process, reply->handle );
         release_object( event );
     }
 

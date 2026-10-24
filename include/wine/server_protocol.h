@@ -1631,7 +1631,9 @@ struct create_event_reply
 {
     struct reply_header __header;
     obj_handle_t handle;
-    char __pad_12[4];
+    int          inproc_type;
+    unsigned int access;
+    unsigned int shm_idx;
 };
 
 
@@ -7124,6 +7126,6 @@ union generic_reply
     struct d3dkmt_mutex_release_reply d3dkmt_mutex_release_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 1810
+#define SERVER_PROTOCOL_VERSION 1811
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

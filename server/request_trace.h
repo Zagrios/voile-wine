@@ -462,6 +462,9 @@ static void dump_create_event_request( const struct create_event_request *req )
 static void dump_create_event_reply( const struct create_event_reply *req )
 {
     fprintf( stderr, " handle=%04x", req->handle );
+    fprintf( stderr, ", inproc_type=%d", req->inproc_type );
+    fprintf( stderr, ", access=%08x", req->access );
+    fprintf( stderr, ", shm_idx=%08x", req->shm_idx );
 }
 
 static void dump_event_op_request( const struct event_op_request *req )

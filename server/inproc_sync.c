@@ -479,6 +479,18 @@ static int get_obj_inproc_sync( struct object *obj, int *type )
 
 #endif /* NTSYNC_IOC_EVENT_READ */
 
+/* Gives a process the in-process sync of a handle it was just given, as get_inproc_sync_fd would, which saves the
+ * request a creator otherwise makes before its first wait. Returns the sync type, 0 when the object has none. */
+int send_inproc_sync( struct process *process, struct object *obj, obj_handle_t handle, unsigned int *shm_idx )
+{
+    int type, fd;
+
+    if ((fd = get_obj_inproc_sync( obj, &type )) < 0) return 0;
+    if (do_msync()) *shm_idx = (unsigned int)fd;
+    else send_client_fd( process, fd, handle );
+    return type;
+}
+
 DECL_HANDLER(get_inproc_sync_fd)
 {
     struct object *obj;

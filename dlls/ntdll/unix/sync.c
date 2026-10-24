@@ -1187,6 +1187,9 @@ NTSTATUS WINAPI GPT_IMPORT(NtCreateEvent)( HANDLE *handle, ACCESS_MASK access, c
     unsigned int ret;
     data_size_t len;
     struct object_attributes *objattr;
+    struct inproc_sync stack;
+    obj_handle_t fd_handle;
+    sigset_t sigset;
 
     TRACE( "access %#x, name %s, type %u, state %u\n", access,
            attr ? debugstr_us(attr->ObjectName) : "(null)", type, state );
@@ -1195,6 +1198,9 @@ NTSTATUS WINAPI GPT_IMPORT(NtCreateEvent)( HANDLE *handle, ACCESS_MASK access, c
     if (type != NotificationEvent && type != SynchronizationEvent) return STATUS_INVALID_PARAMETER;
     if ((ret = alloc_object_attributes( attr, &objattr, &len ))) return ret;
 
+    /* The reply brings the event's in-process sync, which get_inproc_sync() would otherwise fetch at the first use:
+     * received and cached under fd_cache_mutex, as there. */
+    server_enter_uninterrupted_section( &fd_cache_mutex, &sigset );
     SERVER_START_REQ( create_event )
     {
         req->access = access;
@@ -1203,8 +1209,24 @@ NTSTATUS WINAPI GPT_IMPORT(NtCreateEvent)( HANDLE *handle, ACCESS_MASK access, c
         wine_server_add_data( req, objattr, len );
         ret = wine_server_call( req );
         *handle = wine_server_ptr_handle( reply->handle );
+        if (reply->inproc_type)
+        {
+            stack.refcount = 1;
+            if (do_msync()) stack.fd = reply->shm_idx;
+            else
+            {
+                stack.fd = wine_server_receive_fd( &fd_handle );
+                assert( wine_server_ptr_handle(fd_handle) == *handle );
+            }
+            stack.access = reply->access;
+            stack.type = reply->inproc_type;
+            stack.closed = 0;
+            /* the cache keeps the handle's reference; an uncached sync goes at once */
+            release_inproc_sync( cache_inproc_sync( *handle, &stack ) );
+        }
     }
     SERVER_END_REQ;
+    server_leave_uninterrupted_section( &fd_cache_mutex, &sigset );
 
     free( objattr );
     return ret;

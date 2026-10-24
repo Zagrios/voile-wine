@@ -1458,6 +1458,9 @@ typedef volatile struct
     VARARG(objattr,object_attributes); /* object attributes */
 @REPLY
     obj_handle_t handle;        /* handle to the event */
+    int          inproc_type;   /* type of the in-process sync sent with the reply, 0 if none (see get_inproc_sync_fd) */
+    unsigned int access;        /* handle access rights, with inproc_type */
+    unsigned int shm_idx;       /* index of an index-based in-process sync, with inproc_type */
 @END
 
 /* Event operation */
