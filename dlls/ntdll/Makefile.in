@@ -11,12 +11,14 @@ EXTRADLLFLAGS = -nodefaultlibs
 i386_EXTRADLLFLAGS = -Wl,--image-base,0x7bc00000
 x86_64_EXTRADLLFLAGS = -Wl,--image-base,0x170000000
 
-# signal_x86_64.c comes first: its object holds the Nt/Zw syscall stubs, which must sit at the low end of the image like
-# in GNU ld builds (Proton, CrossOver). Packers read ntdll's export table and compare the RVAs of the stubs with the
-# other exports; lld otherwise leaves the stub block behind the C code. tools/make_makefiles sorts SOURCES: move it
-# back to the top after running it.
+# signal_x86_64.c holds the Nt/Zw system call stubs, and its place in SOURCES sets where they sit in the image: packers
+# read ntdll's export table and compare the RVAs of the stubs with the other exports. configure puts it first on Linux
+# hosts (NTDLL_SYSCALLS_FIRST), the Linux engine, where the THEIA packer of HELLDIVERS 2 and THE FINALS wants the stubs
+# at the low end as in GNU ld builds (Proton, CrossOver), and in its sorted place elsewhere (NTDLL_SYSCALLS_IN_ORDER):
+# with lld and the stubs first, Overwatch's protection fails on the macOS engine. tools/make_makefiles sorts SOURCES
+# and drops both variables: put them back after running it.
 SOURCES = \
-	signal_x86_64.c \
+	$(NTDLL_SYSCALLS_FIRST) \
 	actctx.c \
 	atom.c \
 	crypt.c \
@@ -45,6 +47,7 @@ SOURCES = \
 	signal_arm64.c \
 	signal_arm64ec.c \
 	signal_i386.c \
+	$(NTDLL_SYSCALLS_IN_ORDER) \
 	string.c \
 	sync.c \
 	thread.c \

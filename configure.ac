@@ -1099,6 +1099,12 @@ case $host_os in
     ;;
 esac
 
+dnl Obelisk: where ntdll's system call stubs go in its image (dlls/ntdll/Makefile.in): first on Linux hosts
+case $host_os in
+  linux*) AC_SUBST(NTDLL_SYSCALLS_FIRST,signal_x86_64.c) ;;
+  *) AC_SUBST(NTDLL_SYSCALLS_IN_ORDER,signal_x86_64.c) ;;
+esac
+
 dnl **** External libraries ****
 
 if test "x$with_system_dllpath" != "x" -a -n "$PE_ARCHS"
