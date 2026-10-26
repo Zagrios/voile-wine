@@ -2531,6 +2531,16 @@ NTSTATUS WINAPI NtWaitForSingleObject( HANDLE handle, BOOLEAN alertable, const L
 
     TRACE( "handle %p, alertable %u, timeout %s\n", handle, alertable, debugstr_timeout(timeout) );
 
+    if (handle == NtCurrentProcess())
+    {
+        /* The process object signals when the process ends: until then the wait only times out or is interrupted
+         * by an APC, as on Windows, whatever the in-process synchronization or the server do with a pseudo handle. */
+        ret = NtDelayExecution( alertable, timeout );
+        if (!ret || ret == STATUS_NO_YIELD_PERFORMED) ret = STATUS_TIMEOUT;
+        TRACE( "-> %#x\n", ret );
+        return ret;
+    }
+
     if ((ret = inproc_wait( 1, &handle, WaitAny, alertable, timeout )) != STATUS_NOT_IMPLEMENTED)
     {
         TRACE( "-> %#x\n", ret );
