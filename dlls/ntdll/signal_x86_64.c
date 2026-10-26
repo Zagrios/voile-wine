@@ -44,6 +44,7 @@
  *         syscalls
  */
 #define SYSCALL_ENTRY(id,name,args) __ASM_SYSCALL_FUNC( id, name )
+__asm__( ".text\n\t.balign 32" );  /* the stub block starts on a 32-byte boundary (see Makefile.in) */
 ALL_SYSCALLS
 #undef SYSCALL_ENTRY
 
