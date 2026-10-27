@@ -980,6 +980,8 @@ static BOOL sysfs_parse_bitmap(const char *filename, ULONG_PTR *mask)
         *mask = (sizeof(ULONG_PTR)>sizeof(int) ? *mask << (8 * sizeof(DWORD)) : 0) + r;
     }
     fclose( f );
+    /* WINENCPU: the processors past peb->NumberOfProcessors do not exist */
+    *mask &= get_system_affinity_mask();
     return TRUE;
 }
 
@@ -1097,6 +1099,7 @@ static NTSTATUS create_logical_proc_info(void)
             ULONG_PTR thread_mask = 0;
 
             if (i > 8 * sizeof(ULONG_PTR)) break;
+            if (i >= peb->NumberOfProcessors) break;
 
             snprintf(name, sizeof(name), core_info, i, "physical_package_id");
             f = fopen(name, "r");
@@ -1628,7 +1631,6 @@ void init_cpu_info(void)
     FIXME("Detecting the number of processors is not supported.\n");
 #endif
 
-#if defined(__APPLE__)
     /* CW HACK 24711: allow restricting the number of processors through an environment variable */
     {
         const char *ncpu = getenv("WINENCPU");
@@ -1642,7 +1644,6 @@ void init_cpu_info(void)
             }
         }
     }
-#endif
 
     peb->NumberOfProcessors = num;
     init_cpu_model();
