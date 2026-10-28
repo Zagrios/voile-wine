@@ -203,6 +203,7 @@ typedef struct _RTL_USER_PROCESS_PARAMETERS
 
 /* value for Flags field (FIXME: not the correct name) */
 #define PROCESS_PARAMS_FLAG_NORMALIZED 1
+#define PROCESS_PARAMS_IMAGE_KEY_MISSING 0x00004000
 
 typedef struct _PEB_LDR_DATA
 {

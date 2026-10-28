@@ -700,6 +700,7 @@ void init_user_process_params(void)
         return;
 
     new_params->Environment     = env;
+    new_params->Flags           = params->Flags | PROCESS_PARAMS_FLAG_NORMALIZED;
     new_params->DebugFlags      = params->DebugFlags;
     new_params->ConsoleHandle   = params->ConsoleHandle;
     new_params->ConsoleFlags    = params->ConsoleFlags;
