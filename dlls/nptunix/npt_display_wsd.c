@@ -35,7 +35,8 @@ bool npt_enumerate_outputs(struct npt_output_list *list, bool expose_all_modes)
    o->current_height = height;
    o->modes[o->num_modes++] = (struct npt_display_mode){ width, height, hz, 1, 32, true, false };
    for (unsigned int i = 0; i < sizeof(extra) / sizeof(extra[0]) && o->num_modes < NPT_DISPLAY_MAX_MODES; i++) {
-      if (extra[i].w >= width && extra[i].h >= height) continue;
+      /* The same filter as wineobelisk.drv's OBELISK_UpdateDisplayDevices: the DXGI and Win32 mode lists must match. */
+      if (extra[i].w > width || extra[i].h > height || (extra[i].w == width && extra[i].h == height)) continue;
       o->modes[o->num_modes++] = (struct npt_display_mode){ extra[i].w, extra[i].h, hz, 1, 32, false, false };
    }
    list->num_outputs = 1;

@@ -962,7 +962,10 @@ static UINT OBELISK_UpdateDisplayDevices( const struct gdi_device_manager *manag
     modes[count++].dmFields &= ~DM_POSITION;
     for (i = 0; i < ARRAY_SIZE(extra); i++)
     {
-        if (extra[i].w >= width && extra[i].h >= height) continue;
+        /* Only modes the desktop can hold: wsd's display is smaller than the screen under a lower render percent, and a
+         * mode larger than it in one dimension (1600x900 on a 1512x982 desktop) would let a game pick a size it cannot
+         * show. The desktop's own size is already the first mode. */
+        if (extra[i].w > width || extra[i].h > height || (extra[i].w == width && extra[i].h == height)) continue;
         modes[count] = modes[0];
         modes[count].dmPelsWidth = extra[i].w;
         modes[count++].dmPelsHeight = extra[i].h;
