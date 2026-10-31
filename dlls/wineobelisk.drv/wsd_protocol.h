@@ -56,6 +56,8 @@ enum {
   WSD_CURSOR_SET = 31,     /* wsd_cursor_set: the cursor shown over the server's windows */
   WSD_WINDOW_FOCUS = 32,   /* wsd_window: the client activated this window, which becomes the key window */
   WSD_SCREEN_SAVER = 33,   /* wsd_window_flag (window ignored, value: 1 the display may sleep, 0 it stays on) */
+  WSD_AUDIO_OPEN_INPUT = 34, /* wsd_audio_open + 1 fd: an input stream (the default microphone) writing a shared ring */
+  WSD_SET_DISPLAY_MODE = 35, /* wsd_display_mode: the size the client's game switched the display to, see PROTOCOL.md */
 };
 
 /* server -> client */
@@ -100,12 +102,17 @@ enum { WSD_KEY_DOWN = 1u << 0, WSD_KEY_REPEAT = 1u << 1, WSD_KEY_ISO = 1u << 2, 
 struct wsd_hello { uint32_t version, client_pid; };
 struct wsd_hello_reply {
   uint32_t version, server_pid;
-  uint32_t display_width_px, display_height_px; /* main screen, backing pixels */
+  uint32_t display_width_px, display_height_px; /* main screen, pixels at the effective scale */
   uint32_t max_refresh_hz;                      /* NSScreen.maximumFramesPerSecond */
-  uint32_t backing_scale_x1000;
-  int32_t work_x, work_y;                       /* main screen without the menu bar and the Dock, backing pixels, */
+  uint32_t backing_scale_x1000;                 /* the effective scale, see PROTOCOL.md (Render percent) */
+  int32_t work_x, work_y;                       /* main screen without the menu bar and the Dock, same pixels, */
   uint32_t work_width, work_height;             /* origin top-left of the main screen (0x0 from older servers) */
+  uint32_t native_width_px, native_height_px;   /* the screen as it is without a game's display mode (SET_DISPLAY_MODE), */
+                                                /* at the effective scale of the render percent (0x0 from older servers) */
 };
+/* The display mode a game chose: width and height in pixels of the screen it wants. A side of the native screen or
+ * more is not lowered; 0x0 restores the native one. */
+struct wsd_display_mode { uint32_t width_px, height_px; };
 struct wsd_window_create {
   uint32_t window_id; /* chosen by the client, nonzero */
   uint32_t width_px, height_px;
@@ -162,7 +169,11 @@ struct wsd_present_region {
 /* Audio output (PCM, interleaved, little-endian). The client writes frames at ring frame (write_frames % ring_frames)
  * and then publishes write_frames (release); the server's audio callback reads from read_frames and publishes it
  * (release). Both counters only grow (64-bit frame counts); unread = write_frames - read_frames <= ring_frames.
- * The ring data follows the 64-byte header at `offset` in the fd. */
+ * The ring data follows the 64-byte header at `offset` in the fd.
+ * An input stream (WSD_AUDIO_OPEN_INPUT) swaps the roles: the server writes write_frames and the client publishes
+ * read_frames; underrun_frames counts the frames the server dropped because the ring was full. The client resets
+ * the stream itself (read_frames = write_frames), WSD_AUDIO_RESET is refused. START, STOP and CLOSE work as for output;
+ * the frames are converted to the open request's format, rate and channels. */
 enum { WSD_AUDIO_S16 = 1, WSD_AUDIO_S24 = 2, WSD_AUDIO_S32 = 3, WSD_AUDIO_F32 = 4, WSD_AUDIO_U8 = 5 };
 struct wsd_audio_ring {
   uint64_t write_frames;  /* client */
@@ -222,6 +233,7 @@ struct wsd_ev_button {
 struct wsd_ev_motion { uint32_t window_id; uint32_t flags; float x, y; uint64_t time_ns; };
 struct wsd_ev_relative { uint32_t window_id; uint32_t flags; float dx, dy; uint64_t time_ns; };
 struct wsd_ev_wheel { uint32_t window_id; uint32_t precise; float dx, dy; uint64_t time_ns; };
+/* backing_scale_x1000: the effective scale, see PROTOCOL.md (Render percent) */
 struct wsd_ev_resize { uint32_t window_id; uint32_t width_px, height_px; uint32_t backing_scale_x1000; };
 struct wsd_ev_presented {
   uint32_t window_id, buffer_id;
@@ -244,7 +256,8 @@ struct wsd_ev_error { uint32_t request_type; int32_t code; };
 #define WSD_ASSERT_SIZE(t, n)
 #endif
 WSD_ASSERT_SIZE(wsd_hdr, 8);
-WSD_ASSERT_SIZE(wsd_hello_reply, 40);
+WSD_ASSERT_SIZE(wsd_hello_reply, 48);
+WSD_ASSERT_SIZE(wsd_display_mode, 8);
 WSD_ASSERT_SIZE(wsd_window_create, 16);
 WSD_ASSERT_SIZE(wsd_cursor_clip, 24);
 WSD_ASSERT_SIZE(wsd_buffer_attach, 40);

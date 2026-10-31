@@ -100,6 +100,8 @@ static UINT next_buffer_id = 1;
 static UINT64 present_serial;
 static pthread_mutex_t display_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct wsd_hello_reply hello;  /* display_lock held: the screen, from EV_HELLO then EV_DISPLAY */
+static pthread_cond_t display_cond = PTHREAD_COND_INITIALIZER; /* display_lock held: display_serial moved */
+static UINT64 display_serial;  /* display_lock held: counts the EV_DISPLAY, and the rejections of SET_DISPLAY_MODE */
 static BOOL cursor_visible = TRUE;
 static const WCHAR obelisk_window_propW[] = {'_','_','w','i','n','e','_','o','b','e','l','i','s','k','_','w','i','n','d','o','w',0};
 static void (*release_listener)( UINT buffer_id, UINT shown, UINT64 serial );
@@ -931,13 +933,17 @@ static UINT OBELISK_UpdateDisplayDevices( const struct gdi_device_manager *manag
                                                      {1600,900}, {1920,1080}, {2560,1440} };
     struct pci_id pci_id = { 0 };
     struct gdi_monitor monitor = { 0 };
-    DEVMODEW current = { .dmSize = sizeof(current) }, modes[ARRAY_SIZE(extra) + 1];
-    UINT i, count = 0, hz, width, height;
+    DEVMODEW current = { .dmSize = sizeof(current) }, modes[ARRAY_SIZE(extra) + 2];
+    UINT i, count = 0, hz, width, height, native_width, native_height;
 
     pthread_mutex_lock( &display_lock );
     hz = hello.max_refresh_hz ? hello.max_refresh_hz : 60;
     width = hello.display_width_px;
     height = hello.display_height_px;
+    /* The modes are those of the screen as it is without the mode a game chose (OBELISK_ChangeDisplaySettings); a wsd
+     * from before the display mode tells no native size, its screen is always that one. */
+    native_width = hello.native_width_px ? hello.native_width_px : width;
+    native_height = hello.native_height_px ? hello.native_height_px : height;
     pthread_mutex_unlock( &display_lock );
 
     if (!width || !height) return STATUS_NOT_IMPLEMENTED;
@@ -959,19 +965,68 @@ static UINT OBELISK_UpdateDisplayDevices( const struct gdi_device_manager *manag
     current.dmPelsHeight = height;
     current.dmDisplayFrequency = hz;
     modes[count] = current;
-    modes[count++].dmFields &= ~DM_POSITION;
+    modes[count].dmFields &= ~DM_POSITION;
+    modes[count].dmPelsWidth = native_width;
+    modes[count++].dmPelsHeight = native_height;
     for (i = 0; i < ARRAY_SIZE(extra); i++)
     {
-        /* Only modes the desktop can hold: wsd's display is smaller than the screen under a lower render percent, and a
+        /* Only modes the screen can hold: wsd's display is smaller than the screen under a lower render percent, and a
          * mode larger than it in one dimension (1600x900 on a 1512x982 desktop) would let a game pick a size it cannot
-         * show. The desktop's own size is already the first mode. */
-        if (extra[i].w > width || extra[i].h > height || (extra[i].w == width && extra[i].h == height)) continue;
+         * show. The screen's own size is already the first mode. */
+        if (extra[i].w > native_width || extra[i].h > native_height ||
+            (extra[i].w == native_width && extra[i].h == native_height)) continue;
         modes[count] = modes[0];
         modes[count].dmPelsWidth = extra[i].w;
         modes[count++].dmPelsHeight = extra[i].h;
     }
+    /* The mode a game chose is the current one, even when it is none of those (wsd keeps a desktop above 640x480). */
+    for (i = 0; i < count; i++) if (modes[i].dmPelsWidth == width && modes[i].dmPelsHeight == height) break;
+    if (i == count)
+    {
+        modes[count] = modes[0];
+        modes[count].dmPelsWidth = width;
+        modes[count++].dmPelsHeight = height;
+    }
     manager->add_modes( &current, count, modes, param );
     return STATUS_SUCCESS;
+}
+
+/***********************************************************************
+ *           OBELISK_ChangeDisplaySettings
+ *
+ * A game that switches the display to a smaller mode (Direct3D exclusive fullscreen, SetFullscreenState with a mode
+ * switch) draws its picture in the pixels of that mode and reads the pointer in them, as on Windows. wsd has no display
+ * mode to switch: it lowers the scale it converts pixels and points with, so the desktop, the windows and the pointer
+ * are in the pixels of the mode and the picture is stretched to the screen (WSD_SET_DISPLAY_MODE, like a render
+ * percent). A mode of the screen's size or more, or the restorer asking for the registry's, gives the screen back.
+ * wsd answers with the screen as it is (EV_DISPLAY), which Wine then reads again (UpdateDisplayDevices) to give the
+ * game its mode.
+ */
+static LONG OBELISK_ChangeDisplaySettings( LPDEVMODEW displays, LPCWSTR primary_name, HWND hwnd, DWORD flags, LPVOID lparam )
+{
+    struct wsd_display_mode mode = { 0 };
+    struct timespec until;
+    UINT64 serial;
+
+    if (displays && displays->dmPelsWidth && displays->dmPelsHeight)
+    {
+        mode.width_px = displays->dmPelsWidth;
+        mode.height_px = displays->dmPelsHeight;
+    }
+    TRACE( "display mode %ux%u flags %#x\n", mode.width_px, mode.height_px, (int)flags );
+
+    pthread_mutex_lock( &display_lock );
+    serial = display_serial;
+    pthread_mutex_unlock( &display_lock );
+    if (!wsd_send( WSD_SET_DISPLAY_MODE, &mode, sizeof(mode), NULL, 0, -1 )) return DISP_CHANGE_SUCCESSFUL;
+
+    clock_gettime( CLOCK_REALTIME, &until );
+    until.tv_sec += 1;
+    pthread_mutex_lock( &display_lock );
+    while (display_serial == serial)
+        if (pthread_cond_timedwait( &display_cond, &display_lock, &until )) break;
+    pthread_mutex_unlock( &display_lock );
+    return DISP_CHANGE_SUCCESSFUL;
 }
 
 /***********************************************************************
@@ -1225,6 +1280,8 @@ static void handle_event( const struct wsd_hdr *hdr, const char *payload )
         memcpy( &display, payload, min( hdr->len, sizeof(display) ));
         pthread_mutex_lock( &display_lock );
         hello = display;
+        display_serial++;
+        pthread_cond_broadcast( &display_cond );
         pthread_mutex_unlock( &display_lock );
         TRACE( "display now %ux%u @%u Hz\n", display.display_width_px, display.display_height_px, display.max_refresh_hz );
         /* Each process keeps the new size; the desktop's tells Wine, which asks UpdateDisplayDevices again
@@ -1237,6 +1294,13 @@ static void handle_event( const struct wsd_hdr *hdr, const char *payload )
     {
         const struct wsd_ev_error *ev = (const void *)payload;
         ERR( "wsd rejected request %u: %d\n", ev->request_type, ev->code );
+        if (ev->request_type == WSD_SET_DISPLAY_MODE) /* a wsd from before the display mode: nothing to wait for */
+        {
+            pthread_mutex_lock( &display_lock );
+            display_serial++;
+            pthread_cond_broadcast( &display_cond );
+            pthread_mutex_unlock( &display_lock );
+        }
         break;
     }
     default:
@@ -1308,6 +1372,21 @@ OBELISK_EXPORT BOOL obelisk_wsd_get_display( UINT *width, UINT *height, UINT *re
     return ret;
 }
 
+/* The screen as it is without the display mode a game chose, for the modes DXGI lists. */
+OBELISK_EXPORT BOOL obelisk_wsd_get_native_display( UINT *width, UINT *height )
+{
+    BOOL ret;
+
+    pthread_mutex_lock( &display_lock );
+    if ((ret = hello.display_width_px != 0))
+    {
+        *width = hello.native_width_px ? hello.native_width_px : hello.display_width_px;
+        *height = hello.native_height_px ? hello.native_height_px : hello.display_height_px;
+    }
+    pthread_mutex_unlock( &display_lock );
+    return ret;
+}
+
 OBELISK_EXPORT UINT64 obelisk_wsd_next_serial(void)
 {
     return __atomic_add_fetch( &present_serial, 1, __ATOMIC_SEQ_CST );
@@ -1319,6 +1398,7 @@ OBELISK_EXPORT UINT64 obelisk_wsd_next_serial(void)
 static const struct user_driver_funcs obeliskdrv_funcs =
 {
     .pActivateWindow = OBELISK_ActivateWindow,
+    .pChangeDisplaySettings = OBELISK_ChangeDisplaySettings,
     .pClipCursor = OBELISK_ClipCursor,
     .pCreateWindowSurface = OBELISK_CreateWindowSurface,
     .pDestroyCursorIcon = OBELISK_DestroyCursorIcon,
