@@ -266,7 +266,8 @@ static GLuint create_framebuffer( struct opengl_drawable *drawable, const struct
         TRACE( "drawable %p/%u created depth buffer %u\n", drawable, fbo, name );
     }
 
-    funcs->p_glNamedFramebufferDrawBuffer( fbo, GL_COLOR_ATTACHMENT0 );
+    /* GL's defaults for a window: draw into and read from the back buffer if there is one, else the front one */
+    funcs->p_glNamedFramebufferDrawBuffer( fbo, drawable->doublebuffer ? GL_COLOR_ATTACHMENT1 : GL_COLOR_ATTACHMENT0 );
     funcs->p_glNamedFramebufferReadBuffer( fbo, drawable->doublebuffer ? GL_COLOR_ATTACHMENT1 : GL_COLOR_ATTACHMENT0 );
     TRACE( "drawable %p created framebuffer %u\n", drawable, fbo );
 
