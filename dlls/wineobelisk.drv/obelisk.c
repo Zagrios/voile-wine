@@ -1496,3 +1496,34 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
 };
 
 C_ASSERT( ARRAYSIZE(__wine_unix_call_funcs) == obeliskdrv_unix_func_count );
+
+#ifdef _WIN64
+
+/* The calls of a 32-bit process (new WoW64): only the icon's parameters hold a pointer. */
+static NTSTATUS wow64_obeliskdrv_set_app_icon( void *arg )
+{
+    struct
+    {
+        UINT  width, height;
+        ULONG bits;
+    } const *params32 = arg;
+    struct obeliskdrv_app_icon_params params =
+    {
+        .width = params32->width,
+        .height = params32->height,
+        .bits = ULongToPtr( params32->bits ),
+    };
+
+    return obeliskdrv_set_app_icon( &params );
+}
+
+const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
+{
+    obeliskdrv_init,
+    obeliskdrv_read_events,
+    wow64_obeliskdrv_set_app_icon,
+};
+
+C_ASSERT( ARRAYSIZE(__wine_unix_call_wow64_funcs) == obeliskdrv_unix_func_count );
+
+#endif /* _WIN64 */
