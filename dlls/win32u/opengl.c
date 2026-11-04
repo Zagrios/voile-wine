@@ -533,7 +533,7 @@ static UINT egldrv_init_pixel_formats( UINT *onscreen_count )
 {
     const struct opengl_funcs *funcs = &display_funcs;
     struct egl_platform *egl = &display_egl;
-    EGLConfig *configs;
+    EGLConfig *configs, *deep;
     EGLint i, j, render, count;
 
     funcs->p_eglGetConfigs( egl->display, NULL, 0, &count );
@@ -551,6 +551,23 @@ static UINT egldrv_init_pixel_formats( UINT *onscreen_count )
         if (render & EGL_OPENGL_BIT) configs[j++] = configs[i];
     }
     count = j;
+
+    /* Put the configs of at most 8 bits per channel first, keeping their order. Windows drivers list those
+     * formats first, and ChoosePixelFormat keeps the first of the formats that match a request equally well:
+     * Mesa lists RGB10_A2 first, which would answer a request for 32 color bits with 2 alpha bits (and make
+     * every presented frame need a conversion). */
+    if ((deep = malloc( count * sizeof(*deep) )))
+    {
+        EGLint red, n = 0;
+        for (i = 0, j = 0; i < count; i++)
+        {
+            funcs->p_eglGetConfigAttrib( egl->display, configs[i], EGL_RED_SIZE, &red );
+            if (red > 8) deep[n++] = configs[i];
+            else configs[j++] = configs[i];
+        }
+        memcpy( configs + j, deep, n * sizeof(*deep) );
+        free( deep );
+    }
 
     if (TRACE_ON(wgl)) for (i = 0; i < count; i++)
     {
