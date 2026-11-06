@@ -20,7 +20,8 @@ Each change is one commit on `main`; `git log crossover..main` lists them. Sever
 | Area | Changes |
 |---|---|
 | **Steam** | Valve's `steamclient` is redirected to Proton's `lsteamclient`, and the Steam client is registered in each prefix. |
-| **Linux engine** | `wineobelisk.drv` (display and input) and `wineobeliskaudio.drv` (audio) talk to voile-lkd's wsd window server; `nptunix` is the unix side of Neptune's Direct3D driver. ntdll and wineserver run on larger host pages, a host address space that is not a power of two, and hosts without netlink. |
+| **Linux engine** | `wineobelisk.drv` (display and input) and `wineobeliskaudio.drv` (audio) talk to voile-lkd's wsd window server; `nptunix` is the unix side of Neptune's Direct3D driver. Re-showing a window that already has Wine foreground focus restores native key focus, while no-activate windows and inactive-app deferral remain protected. ntdll and wineserver run on larger host pages, a host address space that is not a power of two, and hosts without netlink. |
+| **Hunt: Showdown 1896 display** | The operator-accepted full-monitor configuration is **Fullscreen Windowed**, 3440×1440 with AMD FSR Quality. This does not establish artifact-free rendering: diagonal shadow bands remain, and exclusive DXGI fullscreen is not fixed or accepted. |
 | **Gamepads** | `winebus.sys` serves the gamepads of Obelisk's input service (`bus_obelisk.c`), in both Wines. XInput and Windows.Gaming.Input keep controllers across hotplug and report them from startup. |
 | **Games** | Fixes for fullscreen windows, keyboard state, audio mixing, the Visual C++ runtime version, crash dialogs and memory allocation, among others. |
 | **Prefixes** | User folders stay inside the prefix instead of linking to the Mac home, and the registry is saved outside the wineserver. |

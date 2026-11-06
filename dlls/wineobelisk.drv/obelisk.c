@@ -538,10 +538,12 @@ static void OBELISK_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_h
     }
     if (win->created && visible != win->shown)
     {
-        /* a window shown without activation (SW_SHOWNA, a menu, a tooltip) leaves the Mac's key window where it is */
+        /* A non-activating show preserves native focus unless Wine already activated this window while hidden. */
         UINT show = !visible ? 0 : (swp_flags & SWP_NOACTIVATE) || (ex_style & WS_EX_NOACTIVATE) ? 2 : 1;
         wsd_send( WSD_WINDOW_SHOW, &(struct wsd_window_flag){ win_id( win ), show }, sizeof(struct wsd_window_flag), NULL, 0, -1 );
         win->shown = visible;
+        if (show == 2 && hwnd == NtUserGetForegroundWindow())
+            wsd_send( WSD_WINDOW_FOCUS, &(struct wsd_window){ win_id( win ) }, sizeof(struct wsd_window), NULL, 0, -1 );
     }
     if (win->created && visible && fullscreen != win->fullscreen)
     {
