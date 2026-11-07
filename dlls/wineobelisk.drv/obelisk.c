@@ -128,6 +128,7 @@ static void update_relative_mouse( UINT window_id )
 }  /* WINE_OBELISK_DEBUG_INJECT already sent */
 
 static BOOL latency_trace;
+static BOOL keep_foreground;  /* WINE_OBELISK_KEEP_FOREGROUND, see WSD_EV_APP_DEACTIVATED */
 
 static UINT64 now_ns(void)
 {
@@ -1264,10 +1265,25 @@ static void handle_event( const struct wsd_hdr *hdr, const char *payload )
     {
         HWND foreground = NtUserGetForegroundWindow();
         DWORD pid = 0;
+        BOOL keep = FALSE;
         /* Another Mac app is in front: the game goes to the background as winemac.drv sends it there
          * (macdrv_app_deactivated), the desktop taking the foreground, and gets WM_ACTIVATEAPP. The process that has
-         * the foreground does it. */
+         * the foreground does it. A game that minimizes itself and resizes its buffers on WM_ACTIVATEAPP(0) can be
+         * given WINE_OBELISK_KEEP_FOREGROUND by its Obelisk profile: its fullscreen window then keeps the foreground,
+         * and the game is not told it lost the foreground (no WM_ACTIVATEAPP/WM_ACTIVATE). wsd still suspends the
+         * relative mouse and releases the held keys as the window resigns key. */
         if (!foreground || !NtUserGetWindowThread( foreground, &pid ) || pid != GetCurrentProcessId()) break;
+        if (keep_foreground)
+        {
+            pthread_mutex_lock( &win_lock );
+            if ((win = get_win( foreground )) && win->fullscreen) keep = TRUE;
+            pthread_mutex_unlock( &win_lock );
+        }
+        if (keep)
+        {
+            TRACE( "app deactivated, fullscreen %p kept in the foreground\n", foreground );
+            break;
+        }
         TRACE( "app deactivated, foreground %p to the desktop\n", foreground );
         NtUserClipCursor( NULL );
         NtUserSetForegroundWindowInternal( NtUserGetDesktopWindow() );
@@ -1452,8 +1468,10 @@ static NTSTATUS obeliskdrv_read_events( void *arg )
 {
     char payload[WSD_MAX_PAYLOAD];
     struct wsd_hdr hdr;
+    const char *env = getenv( "WINE_OBELISK_KEEP_FOREGROUND" );
 
     latency_trace = getenv( "WINE_OBELISK_LATENCY" ) != NULL;
+    keep_foreground = env && *env && *env != '0';
 
     while (wsd_read( &hdr, payload )) handle_event( &hdr, payload );
     return STATUS_UNSUCCESSFUL;
