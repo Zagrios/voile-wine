@@ -4170,7 +4170,8 @@ NTSTATUS virtual_alloc_teb( TEB **ret_teb )
         if ((status = NtAllocateVirtualMemory( NtCurrentProcess(), (void **)&ptr, 0, &block_size,
                                                MEM_COMMIT, PAGE_READWRITE )))
         {
-            /* unchecked, init_teb() below faults inside the syscall and virtual_mutex stays locked for ever */
+            /* fail the thread creation instead of letting init_teb() write to an uncommitted page,
+             * and give the slot back so that the next thread retries it */
             ERR( "failed to commit TEB block %p: %08x\n", ptr, status );
             teb_block_pos++;
             server_leave_uninterrupted_section( &virtual_mutex, &sigset );

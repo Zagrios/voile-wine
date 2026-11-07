@@ -1500,7 +1500,6 @@ GPT_ABI_WRAPPER( NtCreateThreadEx );
 void abort_thread( int status )
 {
     pthread_sigmask( SIG_BLOCK, &server_block_set, NULL );
-    server_abandon_uninterrupted_sections( "killed" );
     if (InterlockedDecrement( &nb_threads ) <= 0) abort_process( status );
     pthread_exit_wrapper( status );
 }
