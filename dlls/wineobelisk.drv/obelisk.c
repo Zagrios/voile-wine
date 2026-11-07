@@ -128,6 +128,7 @@ static void update_relative_mouse( UINT window_id )
 }  /* WINE_OBELISK_DEBUG_INJECT already sent */
 
 static BOOL latency_trace;
+static BOOL keep_foreground;  /* WINE_OBELISK_KEEP_FOREGROUND, see WSD_EV_APP_DEACTIVATED */
 
 static UINT64 now_ns(void)
 {
@@ -1268,8 +1269,18 @@ static void handle_event( const struct wsd_hdr *hdr, const char *payload )
          * (macdrv_app_deactivated), the desktop taking the foreground, and gets WM_ACTIVATEAPP. The process that has
          * the foreground does it. */
         if (!foreground || !NtUserGetWindowThread( foreground, &pid ) || pid != GetCurrentProcessId()) break;
-        TRACE( "app deactivated, foreground %p to the desktop\n", foreground );
         NtUserClipCursor( NULL );
+        /* WINE_OBELISK_KEEP_FOREGROUND keeps a fullscreen game in the foreground. HELLDIVERS 2 answers
+         * WM_ACTIVATEAPP(0) by minimizing itself and calling ResizeBuffers twice (hide and restore): 0.5 s without a
+         * frame and a second at 10 fps per Cmd-Tab, and its window thread then dies after a long time hidden.
+         * Kept in the foreground it never learns it went to the background: wsd still suspends the relative
+         * mouse and releases the held keys as its window resigns key. */
+        if (keep_foreground && (win = get_win( foreground )) && win->fullscreen)
+        {
+            TRACE( "app deactivated, fullscreen %p kept in the foreground\n", foreground );
+            break;
+        }
+        TRACE( "app deactivated, foreground %p to the desktop\n", foreground );
         NtUserSetForegroundWindowInternal( NtUserGetDesktopWindow() );
         break;
     }
@@ -1454,6 +1465,7 @@ static NTSTATUS obeliskdrv_read_events( void *arg )
     struct wsd_hdr hdr;
 
     latency_trace = getenv( "WINE_OBELISK_LATENCY" ) != NULL;
+    keep_foreground = getenv( "WINE_OBELISK_KEEP_FOREGROUND" ) != NULL;
 
     while (wsd_read( &hdr, payload )) handle_event( &hdr, payload );
     return STATUS_UNSUCCESSFUL;
