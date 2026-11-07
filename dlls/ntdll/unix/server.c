@@ -1570,6 +1570,10 @@ static int init_thread_pipe(void)
     wine_server_send_fd( reply_pipe[1] );
     wine_server_send_fd( ntdll_get_thread_data()->wait_fd[1] );
     ntdll_get_thread_data()->reply_fd = reply_pipe[0];
+    /* The server now holds the only write end (the one in flight): if it drops this thread without
+     * a reply (terminated before init_thread was read, or init_thread failed), the read gets EOF
+     * instead of blocking forever. The number stays the key of the in-flight fd for the request. */
+    close( reply_pipe[1] );
     return reply_pipe[1];
 }
 
@@ -1690,7 +1694,6 @@ size_t server_init_process(void)
         }
     }
     SERVER_END_REQ;
-    close( reply_pipe );
 
     if (ret) server_protocol_error( "init_first_thread failed with status %x\n", ret );
 
@@ -1846,7 +1849,6 @@ void server_init_thread( void *entry_point, BOOL *suspend )
         *suspend = reply->suspend;
     }
     SERVER_END_REQ;
-    close( reply_pipe );
 }
 
 NTSTATUS WINAPI NtAllocateReserveObject( HANDLE *handle, const OBJECT_ATTRIBUTES *attr,
