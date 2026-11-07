@@ -4167,8 +4167,16 @@ NTSTATUS virtual_alloc_teb( TEB **ret_teb )
             teb_block_pos = 32;
         }
         ptr = ((char *)teb_block + --teb_block_pos * block_size);
-        NtAllocateVirtualMemory( NtCurrentProcess(), (void **)&ptr, 0, &block_size,
-                                 MEM_COMMIT, PAGE_READWRITE );
+        if ((status = NtAllocateVirtualMemory( NtCurrentProcess(), (void **)&ptr, 0, &block_size,
+                                               MEM_COMMIT, PAGE_READWRITE )))
+        {
+            /* fail the thread creation instead of letting init_teb() write to an uncommitted page,
+             * and give the slot back so that the next thread retries it */
+            ERR( "failed to commit TEB block %p: %08x\n", ptr, status );
+            teb_block_pos++;
+            server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+            return status;
+        }
     }
     *ret_teb = teb = init_teb( ptr, is_wow64() );
 
