@@ -2364,7 +2364,11 @@ static BOOL handle_syscall_fault( ucontext_t *sigcontext, EXCEPTION_RECORD *rec,
     }
     else
     {
-        TRACE_(seh)( "returning to user mode ip=%016lx ret=%08x\n", frame->rip, rec->ExceptionCode );
+        ERR_(seh)( "fault %08x at %p (info %016lx %016lx) inside a syscall, ip=%016lx, returning to user mode ip=%016lx tid=%04x\n",
+                   rec->ExceptionCode, rec->ExceptionAddress, rec->ExceptionInformation[0], rec->ExceptionInformation[1],
+                   context->Rip, frame->rip, GetCurrentThreadId() );
+        server_abandon_uninterrupted_sections( "faulted inside a syscall" );
+        pthread_sigmask( SIG_UNBLOCK, &server_block_set, NULL );
         RAX_sig(sigcontext) = rec->ExceptionCode;
         R13_sig(sigcontext) = (ULONG_PTR)NtCurrentTeb();
         RSP_sig(sigcontext) = (ULONG_PTR)frame;

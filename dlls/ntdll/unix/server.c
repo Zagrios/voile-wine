@@ -326,10 +326,17 @@ NTSTATUS unixcall_wine_server_call( void *args )
 /***********************************************************************
  *           server_enter_uninterrupted_section
  */
+/* The uninterrupted-section mutexes this thread holds, innermost last. glibc TLS, not the TEB: the first
+ * sections run before the thread's TEB exists (virtual_init, virtual_alloc_first_teb). */
+static __thread pthread_mutex_t *held_mutex[8];
+static __thread int held_mutex_count;
+
 void server_enter_uninterrupted_section( pthread_mutex_t *mutex, sigset_t *sigset )
 {
     pthread_sigmask( SIG_BLOCK, &server_block_set, sigset );
     mutex_lock( mutex );
+    if (held_mutex_count < ARRAY_SIZE(held_mutex)) held_mutex[held_mutex_count] = mutex;
+    held_mutex_count++;
 }
 
 
@@ -338,8 +345,29 @@ void server_enter_uninterrupted_section( pthread_mutex_t *mutex, sigset_t *sigse
  */
 void server_leave_uninterrupted_section( pthread_mutex_t *mutex, sigset_t *sigset )
 {
+    held_mutex_count--;
     mutex_unlock( mutex );
     pthread_sigmask( SIG_SETMASK, sigset, NULL );
+}
+
+
+/***********************************************************************
+ *           server_abandon_uninterrupted_sections
+ *
+ * Release the uninterrupted-section mutexes this thread still holds, innermost first. Used when a thread leaves
+ * a system call without unwinding it: a fault inside the call (handle_syscall_fault returns straight to user mode)
+ * or a kill (abort_thread). Left locked, virtual_mutex or fd_cache_mutex freezes every other thread of the
+ * process silently; the state they protect may be half-updated, but that is a crash later instead of a hang now.
+ */
+void server_abandon_uninterrupted_sections( const char *why )
+{
+    int i, n = held_mutex_count;
+
+    if (n <= 0) return;
+    ERR( "thread %04x %s while holding %d uninterrupted section(s), releasing them\n", GetCurrentThreadId(), why, n );
+    if (n > ARRAY_SIZE(held_mutex)) n = ARRAY_SIZE(held_mutex);
+    for (i = n - 1; i >= 0; i--) mutex_unlock( held_mutex[i] );
+    held_mutex_count = 0;
 }
 
 
