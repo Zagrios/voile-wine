@@ -1265,22 +1265,27 @@ static void handle_event( const struct wsd_hdr *hdr, const char *payload )
     {
         HWND foreground = NtUserGetForegroundWindow();
         DWORD pid = 0;
+        BOOL keep = FALSE;
         /* Another Mac app is in front: the game goes to the background as winemac.drv sends it there
          * (macdrv_app_deactivated), the desktop taking the foreground, and gets WM_ACTIVATEAPP. The process that has
-         * the foreground does it. */
+         * the foreground does it. A game that minimizes itself and resizes its buffers on WM_ACTIVATEAPP(0) can be
+         * given WINE_OBELISK_KEEP_FOREGROUND by its Obelisk profile: its fullscreen window then keeps the foreground,
+         * and the game is not told it lost the foreground (no WM_ACTIVATEAPP/WM_ACTIVATE). wsd still suspends the
+         * relative mouse and releases the held keys as the window resigns key. */
         if (!foreground || !NtUserGetWindowThread( foreground, &pid ) || pid != GetCurrentProcessId()) break;
-        NtUserClipCursor( NULL );
-        /* WINE_OBELISK_KEEP_FOREGROUND keeps a fullscreen game in the foreground. HELLDIVERS 2 answers
-         * WM_ACTIVATEAPP(0) by minimizing itself and calling ResizeBuffers twice (hide and restore): 0.5 s without a
-         * frame and a second at 10 fps per Cmd-Tab, and its window thread then dies after a long time hidden.
-         * Kept in the foreground it never learns it went to the background: wsd still suspends the relative
-         * mouse and releases the held keys as its window resigns key. */
-        if (keep_foreground && (win = get_win( foreground )) && win->fullscreen)
+        if (keep_foreground)
+        {
+            pthread_mutex_lock( &win_lock );
+            if ((win = get_win( foreground )) && win->fullscreen) keep = TRUE;
+            pthread_mutex_unlock( &win_lock );
+        }
+        if (keep)
         {
             TRACE( "app deactivated, fullscreen %p kept in the foreground\n", foreground );
             break;
         }
         TRACE( "app deactivated, foreground %p to the desktop\n", foreground );
+        NtUserClipCursor( NULL );
         NtUserSetForegroundWindowInternal( NtUserGetDesktopWindow() );
         break;
     }
@@ -1463,9 +1468,10 @@ static NTSTATUS obeliskdrv_read_events( void *arg )
 {
     char payload[WSD_MAX_PAYLOAD];
     struct wsd_hdr hdr;
+    const char *env = getenv( "WINE_OBELISK_KEEP_FOREGROUND" );
 
     latency_trace = getenv( "WINE_OBELISK_LATENCY" ) != NULL;
-    keep_foreground = getenv( "WINE_OBELISK_KEEP_FOREGROUND" ) != NULL;
+    keep_foreground = env && *env && *env != '0';
 
     while (wsd_read( &hdr, payload )) handle_event( &hdr, payload );
     return STATUS_UNSUCCESSFUL;
