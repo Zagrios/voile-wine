@@ -106,26 +106,12 @@ static BOOL cursor_visible = TRUE;
 static const WCHAR obelisk_window_propW[] = {'_','_','w','i','n','e','_','o','b','e','l','i','s','k','_','w','i','n','d','o','w',0};
 static void (*release_listener)( UINT buffer_id, UINT shown, UINT64 serial );
 static void (*presented_listener)( UINT buffer_id, UINT64 serial, UINT64 presented_ns );
-static BOOL debug_injected;
+static BOOL debug_injected;  /* WINE_OBELISK_DEBUG_INJECT already sent */
 static BOOL wsd_send( UINT type, const void *payload, UINT len, const void *extra, UINT extra_len, int fd );
 static UINT relative_window;  /* wsd window in relative mouse mode, 0 when none */
 static BOOL clip_active;
 static float relative_rest_x, relative_rest_y;  /* fractions of a pixel not sent yet */
-static UINT64 last_warp_ns;  /* SetCursorPos: the mouse moves wsd sent before it carry the old place */
-
-/* Relative (raw delta) mouse while the game hides the cursor and confines it to its window, like a captured mouse
- * on Windows; absolute otherwise. */
-static void update_relative_mouse( UINT window_id )
-{
-    UINT want = (!cursor_visible && clip_active) ? window_id : 0;
-    if (want == relative_window) return;
-    if (relative_window)
-        wsd_send( WSD_RELATIVE_MOUSE, &(struct wsd_window_flag){ relative_window, 0 }, sizeof(struct wsd_window_flag), NULL, 0, -1 );
-    if (want)
-        wsd_send( WSD_RELATIVE_MOUSE, &(struct wsd_window_flag){ want, 1 }, sizeof(struct wsd_window_flag), NULL, 0, -1 );
-    TRACE( "relative mouse window %u -> %u\n", relative_window, want );
-    relative_window = want;
-}  /* WINE_OBELISK_DEBUG_INJECT already sent */
+static UINT64 last_warp_ns;  /* last warp (SetCursorPos, end of relative mode): older wsd moves carry the old place */
 
 static BOOL latency_trace;
 static BOOL keep_foreground;  /* WINE_OBELISK_KEEP_FOREGROUND, see WSD_EV_APP_DEACTIVATED */
@@ -264,6 +250,8 @@ static void destroy_win( struct obelisk_win *win )
     for (i = 0; i < NB_BUFFERS; i++) free_buffer( &win->buffers[i] );
     if (win->created)
         wsd_send( WSD_WINDOW_DESTROY, &(struct wsd_window){ win_id( win ) }, sizeof(struct wsd_window), NULL, 0, -1 );
+    /* wsd leaves relative mode with its window, whose id the next window created may get */
+    if (win_id( win ) == relative_window) relative_window = 0;
     memset( win, 0, sizeof(*win) );
 }
 
@@ -336,6 +324,44 @@ static BOOL alloc_buffer( struct obelisk_buffer *buf, UINT width, UINT height )
     buf->busy = FALSE;
     TRACE( "buffer %u %ux%u stride %u\n", buf->id, width, height, stride );
     return TRUE;
+}
+
+/* win_lock released: a shown, unminimized fullscreen window, where a hidden cursor means a captured mouse */
+static BOOL fullscreen_shown( UINT window_id )
+{
+    struct obelisk_win *win;
+    BOOL ret;
+    pthread_mutex_lock( &win_lock );
+    ret = (win = get_win_by_id( window_id )) && win->created && win->shown && win->fullscreen && !win->minimized;
+    pthread_mutex_unlock( &win_lock );
+    return ret;
+}
+
+/* win_lock released. Relative (raw delta) mouse while the game hides the cursor and confines it to its window, or
+ * hides it over a fullscreen window, like a captured mouse on Windows, as winewayland.drv locks the pointer
+ * (wayland_pointer_update_constraint); absolute otherwise. A clip of the whole screen reaches the driver as no clip
+ * (win32u input.c): without the fullscreen case, a game that hides its cursor there (HELLDIVERS 2) was relative only
+ * during win32u's own clip after a button press, and each return to absolute mode gave it the deltas of that time
+ * back as one jump. Leaving relative mode warps the Mac pointer to Wine's cursor, which followed the deltas while the
+ * pointer stood still, as winewayland.drv gives Wine's cursor to the locked pointer as its position hint: the first
+ * absolute move then carries no offset. */
+static void update_relative_mouse( UINT window_id )
+{
+    UINT want = (!cursor_visible && (clip_active || fullscreen_shown( window_id ))) ? window_id : 0;
+    POINT pos;
+    if (want == relative_window) return;
+    if (relative_window)
+        wsd_send( WSD_RELATIVE_MOUSE, &(struct wsd_window_flag){ relative_window, 0 }, sizeof(struct wsd_window_flag), NULL, 0, -1 );
+    if (want)
+        wsd_send( WSD_RELATIVE_MOUSE, &(struct wsd_window_flag){ want, 1 }, sizeof(struct wsd_window_flag), NULL, 0, -1 );
+    TRACE( "relative mouse window %u -> %u\n", relative_window, want );
+    relative_window = want;
+    if (!want && NtUserGetCursorPos( &pos ))
+    {
+        __atomic_store_n( &last_warp_ns, now_ns(), __ATOMIC_RELAXED );
+        TRACE( "warp to %d,%d, the cursor after relative mode\n", (int)pos.x, (int)pos.y );
+        wsd_send( WSD_CURSOR_WARP, &(struct wsd_cursor_pos){ pos.x, pos.y }, sizeof(struct wsd_cursor_pos), NULL, 0, -1 );
+    }
 }
 
 /***********************************************************************
@@ -461,8 +487,8 @@ static void OBELISK_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_h
     BOOL minimized = (style & WS_VISIBLE) && (style & WS_MINIMIZE);
     BOOL fullscreen = !!(swp_flags & WINE_SWP_FULLSCREEN);
     UINT width = rects->visible.right - rects->visible.left, height = rects->visible.bottom - rects->visible.top;
-    UINT frame = frame_style( style, ex_style );
-    struct obelisk_win *win;
+    UINT frame = frame_style( style, ex_style ), id;
+    struct obelisk_win *win = NULL;
 
     if (!is_toplevel( hwnd )) return;
     TRACE( "hwnd %p rects %s flags %08x visible %u fullscreen %u\n", hwnd, debugstr_window_rects( rects ),
@@ -550,7 +576,11 @@ static void OBELISK_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_h
         win->fullscreen = fullscreen;
     }
 done:
+    id = win ? win_id( win ) : 0;
     pthread_mutex_unlock( &win_lock );
+    /* shown, fullscreen or minimized changed, also by the user (WSD_EV_MINIMIZE posts WM_SYSCOMMAND): relative mouse
+     * mode follows (update_relative_mouse) */
+    if (id && hwnd == NtUserGetForegroundWindow()) update_relative_mouse( id );
 }
 
 /* Applies in the window's thread the frame the user gave the macOS window (WSD_EV_FRAME). */
