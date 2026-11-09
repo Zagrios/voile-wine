@@ -569,6 +569,11 @@ static void OBELISK_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_h
         UINT show = !visible ? 0 : (swp_flags & SWP_NOACTIVATE) || (ex_style & WS_EX_NOACTIVATE) ? 2 : 1;
         wsd_send( WSD_WINDOW_SHOW, &(struct wsd_window_flag){ win_id( win ), show }, sizeof(struct wsd_window_flag), NULL, 0, -1 );
         win->shown = visible;
+        /* but the foreground window becomes the key window all the same: Wine activated it, or kept it active, while
+         * wsd did not show it (hidden, empty or too large), and OBELISK_ActivateWindow only gives the key window to a
+         * shown window; winex11.drv likewise activates the foreground window it maps (window_set_wm_state) */
+        if (show == 2 && hwnd == NtUserGetForegroundWindow())
+            wsd_send( WSD_WINDOW_FOCUS, &(struct wsd_window){ win_id( win ) }, sizeof(struct wsd_window), NULL, 0, -1 );
     }
     if (win->created && visible && fullscreen != win->fullscreen)
     {
