@@ -1377,6 +1377,12 @@ OBELISK_EXPORT void obelisk_wsd_set_release_listener( void (*listener)( UINT buf
     release_listener = listener;
 }
 
+/* the listener set before, for a caller that installs its own and passes on the events of buffers not its own */
+OBELISK_EXPORT void *obelisk_wsd_get_release_listener(void)
+{
+    return (void *)release_listener;
+}
+
 OBELISK_EXPORT void obelisk_wsd_set_presented_listener( void (*listener)( UINT buffer_id, UINT64 serial, UINT64 presented_ns ) )
 {
     presented_listener = listener;

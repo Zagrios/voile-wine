@@ -26,6 +26,15 @@
 #include <assert.h>
 #include <pthread.h>
 #include <dlfcn.h>
+#include <errno.h>
+#include <signal.h>
+#include <stdio.h>
+#include <time.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/syscall.h>
+#include <sys/un.h>
 
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
@@ -36,6 +45,7 @@
 #include "wine/opengl_driver.h"
 
 #include "dibdrv/dibdrv.h"
+#include "../wineobelisk.drv/wsd_protocol.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(wgl);
 
@@ -174,12 +184,18 @@ static BOOL opengl_drawable_swap( struct opengl_drawable *drawable )
 
 #ifdef SONAME_LIBEGL
 
+struct gl_present;
+
 struct framebuffer_surface
 {
     struct opengl_drawable base;
     void                  *bits;            /* pixels of the last swapped frame, for the window */
     SIZE_T                 bits_size;
+    struct gl_present     *present;         /* frames shown without a readback (gl_present_swap) */
 };
+
+static void gl_present_destroy( struct gl_present *present );
+static void gl_present_forget_context( struct gl_present *present );
 
 static GLenum color_format_from_pfd( const struct wgl_pixel_format *desc )
 {
@@ -336,6 +352,7 @@ static void framebuffer_surface_destroy( struct opengl_drawable *drawable )
     struct framebuffer_surface *surface = CONTAINING_RECORD( drawable, struct framebuffer_surface, base );
     TRACE( "%s\n", debugstr_opengl_drawable( drawable ) );
     free( surface->bits );
+    gl_present_destroy( surface->present );
 }
 
 static void framebuffer_surface_resize( struct opengl_drawable *drawable )
@@ -368,6 +385,8 @@ static void framebuffer_surface_set_context( struct opengl_drawable *drawable, v
 
     if (!private)
     {
+        /* the context that lets go of the drawable is still current */
+        gl_present_forget_context( CONTAINING_RECORD( drawable, struct framebuffer_surface, base )->present );
         if (drawable->draw_fbo != drawable->read_fbo)
         {
             destroy_framebuffer( drawable, &draw_desc, drawable->draw_fbo );
@@ -395,6 +414,640 @@ static void framebuffer_surface_flush( struct opengl_drawable *drawable, UINT fl
     if (flags & GL_FLUSH_UPDATED && drawable->read_fbo) framebuffer_surface_resize( drawable );
 }
 
+
+/* Obelisk's Linux engine: frames shown without a readback. The render server (Neptune's vtest server with
+ * --use-cgl) and the window server (wsd) share six memory buffers per window with this process: the buffers are
+ * attached to wsd through the display driver's connection and to the render server through a connection of our
+ * own. On swap, the back buffer is blitted into a texture, a debug marker names the buffer to fill
+ * ("obelisk-present token=... buf=... serial=..."), and the swap returns. The render server copies the texture into
+ * that buffer on the GPU and confirms it in a trailer after the pixels; a present thread of ours watches the trailers
+ * and has wsd show each buffer on the window's overlay plane once it is filled. Without the display driver or the
+ * render server's support (a frame not confirmed), swaps read the frame back as before.
+ *
+ * The present thread is a plain thread, not a Win32 one: it only reads memory and writes to wsd's socket, and uses no
+ * Wine debug output. */
+
+#define GLP_BUFFERS        6  /* wsd holds two (shown, next); one is copied, one drawn into */
+#define GLP_STRIDE_ALIGN   256
+#define GLP_SHM_ALIGN      0x4000
+#define GLP_TRAILER_SIZE   16
+#define GLP_TRAILER_MAGIC  0x50424c4f
+#define GLP_ID_TAG         0xc0000000  /* bit 31: the driver passes the buffer's events on; bit 30: ours */
+#define GLP_SLOTS          64
+#define VTEST_HDR_SIZE     2
+#define VCMD_CREATE_RENDERER 8
+#define VCMD_PROTOCOL_VERSION 11
+#define VCMD_OBELISK_PRESENT_ATTACH 39
+#define VCMD_OBELISK_PRESENT_DETACH 40
+#define GLP_JOBS           16
+#define GLP_WAIT_NS        500000000  /* how long a frame may take to be confirmed */
+
+struct gl_present_buffer
+{
+    void  *map;
+    SIZE_T size;
+    UINT   stride;
+    UINT   wsd_id;
+    int    slot;
+};
+
+struct gl_present
+{
+    UINT64 token;
+    UINT   window_id;
+    int    width, height;
+    struct gl_present_buffer buf[GLP_BUFFERS];
+    UINT   next;
+    UINT64 serial;
+    GLuint texture, fbo, src_fbo;
+    int    texture_width, texture_height;
+    void  *context;      /* the GL context the objects above belong to */
+    UINT   presents;
+};
+
+/* a frame for the present thread: the buffer it is shown in once its trailer has the serial */
+struct glp_job
+{
+    const UINT8 *trailer;
+    UINT64 serial;
+    UINT   window_id, buffer_id;
+    int    slot;
+    int    width, height;
+};
+
+/* glp_lock: the process's state, the buffer slots (the release listener runs on the driver's event thread) and the
+ * present thread's queue; glp_server_lock: the render server connection. A drawable's present state belongs to its
+ * swapping thread. */
+static pthread_mutex_t glp_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t glp_server_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t glp_job_cond = PTHREAD_COND_INITIALIZER;   /* a job was queued */
+static pthread_cond_t glp_free_cond = PTHREAD_COND_INITIALIZER;  /* a buffer was released or a job finished */
+static struct glp_job glp_jobs[GLP_JOBS];
+static UINT glp_job_head, glp_job_count;   /* the job at glp_job_head stays queued until it is done */
+static UINT64 glp_failed_serial;           /* the frame the present thread saw fail, for the swapping thread's log */
+static BOOL glp_tried, glp_disabled, glp_failure_logged;
+static int glp_vtest_fd = -1;
+static UINT glp_generation;
+static struct { UINT id; BOOL busy; struct gl_present *present; } glp_slots[GLP_SLOTS];
+static BOOL (*p_obelisk_wsd_send)( UINT type, const void *payload, UINT len, int fd );
+static void (*p_obelisk_wsd_set_release_listener)( void (*listener)( UINT, UINT, UINT64 ) );
+static void *(*p_obelisk_wsd_get_release_listener)(void);
+static BOOL (*p_obelisk_wsd_client_rect)( UINT window_id, int *x, int *y, UINT *width, UINT *height );
+static UINT64 (*p_obelisk_wsd_next_serial)(void);
+static void (*glp_chained_listener)( UINT, UINT, UINT64 );
+
+static void glp_release_listener( UINT buffer_id, UINT shown, UINT64 serial )
+{
+    int i;
+    if ((buffer_id & GLP_ID_TAG) != GLP_ID_TAG)
+    {
+        if (glp_chained_listener) glp_chained_listener( buffer_id, shown, serial );
+        return;
+    }
+    pthread_mutex_lock( &glp_lock );
+    for (i = 0; i < GLP_SLOTS; i++)
+    {
+        if (glp_slots[i].id != buffer_id) continue;
+        glp_slots[i].busy = FALSE;
+    }
+    pthread_cond_broadcast( &glp_free_cond );
+    pthread_mutex_unlock( &glp_lock );
+}
+
+static INT64 glp_elapsed_ns( const struct timespec *start )
+{
+    struct timespec now;
+    clock_gettime( CLOCK_MONOTONIC, &now );
+    return (INT64)(now.tv_sec - start->tv_sec) * 1000000000 + now.tv_nsec - start->tv_nsec;
+}
+
+enum glp_frame { GLP_FRAME_COPIED, GLP_FRAME_FAILED, GLP_FRAME_LATE };
+
+/* waits for the render server to confirm the frame, or fail it */
+static enum glp_frame glp_wait_trailer( const UINT8 *trailer, UINT64 serial )
+{
+    struct timespec start;
+    UINT spins = 0;
+
+    clock_gettime( CLOCK_MONOTONIC, &start );
+    for (;;)
+    {
+        if (__atomic_load_n( (const UINT64 *)(trailer + 8), __ATOMIC_ACQUIRE ) == serial)
+            return *(volatile const UINT32 *)trailer == GLP_TRAILER_MAGIC && !*(volatile const UINT32 *)(trailer + 4)
+                   ? GLP_FRAME_COPIED : GLP_FRAME_FAILED;
+        if (++spins < 64) continue;
+        if (glp_elapsed_ns( &start ) > GLP_WAIT_NS) return GLP_FRAME_LATE;
+        usleep( 50 );
+    }
+}
+
+/* A frame the render server failed is not shown (a context's first frames can fail while its objects are new); a
+ * run of them, or one it does not answer, sends the process back to readbacks. */
+#define GLP_MAX_FAILED 8
+
+static void *glp_present_thread( void *arg )
+{
+    UINT failed_run = 0;
+
+    pthread_mutex_lock( &glp_lock );
+    for (;;)
+    {
+        struct wsd_present_region region;
+        struct glp_job job;
+        enum glp_frame frame;
+        BOOL shown = FALSE, failed = FALSE;
+        int x, y;
+        UINT w, h;
+
+        while (!glp_job_count) pthread_cond_wait( &glp_job_cond, &glp_lock );
+        job = glp_jobs[glp_job_head];
+        pthread_mutex_unlock( &glp_lock );
+
+        if (!glp_disabled)
+        {
+            frame = glp_wait_trailer( job.trailer, job.serial );
+            if (frame == GLP_FRAME_FAILED) failed_run++;
+            else if (frame == GLP_FRAME_COPIED) failed_run = 0;
+            if (frame == GLP_FRAME_COPIED)
+            {
+                memset( &region, 0, sizeof(region) );
+                region.present.window_id = job.window_id;
+                region.present.buffer_id = job.buffer_id;
+                region.present.serial = p_obelisk_wsd_next_serial();
+                if (!p_obelisk_wsd_client_rect( job.window_id, &x, &y, &w, &h ))
+                {
+                    x = y = 0;
+                    w = job.width;
+                    h = job.height;
+                }
+                region.x = x;
+                region.y = y;
+                region.width = w;
+                region.height = h;
+                if (!(shown = p_obelisk_wsd_send( WSD_PRESENT_REGION, &region, sizeof(region), -1 ))) frame = GLP_FRAME_LATE;
+            }
+            if (frame == GLP_FRAME_LATE || failed_run >= GLP_MAX_FAILED)
+            {
+                /* the window's frames are read back from now on, so its overlay plane goes */
+                memset( &region, 0, sizeof(region) );
+                region.present.window_id = job.window_id;
+                p_obelisk_wsd_send( WSD_PRESENT_REGION, &region, sizeof(region), -1 );
+                failed = TRUE;
+            }
+        }
+
+        pthread_mutex_lock( &glp_lock );
+        if (!shown)  /* wsd releases the ones it was given */
+        {
+            glp_slots[job.slot].busy = FALSE;
+        }
+        if (failed && !glp_disabled)
+        {
+            glp_disabled = TRUE;
+            glp_failed_serial = job.serial;
+        }
+        glp_job_head = (glp_job_head + 1) % GLP_JOBS;
+        glp_job_count--;
+        pthread_cond_broadcast( &glp_free_cond );
+    }
+    return NULL;
+}
+
+/* waits for the present thread to finish the frames it has, before their buffers go */
+static void glp_drain(void)
+{
+    struct timespec deadline;
+
+    clock_gettime( CLOCK_REALTIME, &deadline );
+    deadline.tv_sec += 1;
+    pthread_mutex_lock( &glp_lock );
+    while (glp_job_count && pthread_cond_timedwait( &glp_free_cond, &glp_lock, &deadline ) != ETIMEDOUT) ;
+    pthread_mutex_unlock( &glp_lock );
+}
+
+static BOOL glp_write_all( int fd, const void *data, size_t size )
+{
+    const char *ptr = data;
+    while (size)
+    {
+        ssize_t ret = write( fd, ptr, size );
+        if (ret < 0 && errno == EINTR) continue;
+        if (ret <= 0) return FALSE;
+        ptr += ret;
+        size -= ret;
+    }
+    return TRUE;
+}
+
+static BOOL glp_read_all( int fd, void *data, size_t size )
+{
+    char *ptr = data;
+    while (size)
+    {
+        ssize_t ret = read( fd, ptr, size );
+        if (ret < 0 && errno == EINTR) continue;
+        if (ret <= 0) return FALSE;
+        ptr += ret;
+        size -= ret;
+    }
+    return TRUE;
+}
+
+/* the display driver's wsd connection and a connection of our own to the render server, once per process */
+static BOOL glp_init(void)
+{
+    static const char name[] = "wine-gl-present";
+    struct sockaddr_un addr = { .sun_family = AF_UNIX };
+    const char *path = getenv( "VTEST_SOCKET_NAME" );
+    UINT32 hdr[VTEST_HDR_SIZE], version[VTEST_HDR_SIZE + 1];
+    sigset_t signals, old_signals;
+    pthread_t thread;
+    BOOL started;
+    void *driver;
+    int fd;
+
+    if (glp_tried) return !glp_disabled;
+    glp_tried = TRUE;
+    glp_disabled = TRUE;
+
+    if (!(driver = dlopen( "wineobelisk.so", RTLD_NOW | RTLD_NOLOAD ))) return FALSE;
+    p_obelisk_wsd_send = dlsym( driver, "obelisk_wsd_send" );
+    p_obelisk_wsd_set_release_listener = dlsym( driver, "obelisk_wsd_set_release_listener" );
+    p_obelisk_wsd_get_release_listener = dlsym( driver, "obelisk_wsd_get_release_listener" );
+    p_obelisk_wsd_client_rect = dlsym( driver, "obelisk_wsd_client_rect" );
+    p_obelisk_wsd_next_serial = dlsym( driver, "obelisk_wsd_next_serial" );
+    if (!p_obelisk_wsd_send || !p_obelisk_wsd_set_release_listener || !p_obelisk_wsd_get_release_listener ||
+        !p_obelisk_wsd_client_rect || !p_obelisk_wsd_next_serial || !path || strlen( path ) >= sizeof(addr.sun_path))
+        return FALSE;
+
+    strcpy( addr.sun_path, path );
+    if ((fd = socket( AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0 )) < 0) return FALSE;
+    hdr[0] = sizeof(name);
+    hdr[1] = VCMD_CREATE_RENDERER;
+    if (connect( fd, (struct sockaddr *)&addr, sizeof(addr) ) < 0 || !glp_write_all( fd, hdr, sizeof(hdr) ) ||
+        !glp_write_all( fd, name, sizeof(name) ))
+    {
+        WARN( "no connection to the render server at %s: %s\n", path, strerror( errno ) );
+        close( fd );
+        return FALSE;
+    }
+    /* a server with several clients makes contexts only for protocol version 3 and later */
+    version[0] = 1;
+    version[1] = VCMD_PROTOCOL_VERSION;
+    version[2] = 3;
+    if (!glp_write_all( fd, version, sizeof(version) ) || !glp_read_all( fd, version, sizeof(version) ) ||
+        version[1] != VCMD_PROTOCOL_VERSION || version[2] < 3)
+    {
+        WARN( "the render server's protocol is too old for presents\n" );
+        close( fd );
+        return FALSE;
+    }
+    /* the present thread takes no signals: Wine's handlers expect a Win32 thread */
+    sigfillset( &signals );
+    pthread_sigmask( SIG_SETMASK, &signals, &old_signals );
+    started = !pthread_create( &thread, NULL, glp_present_thread, NULL );
+    pthread_sigmask( SIG_SETMASK, &old_signals, NULL );
+    if (!started)
+    {
+        WARN( "no present thread\n" );
+        close( fd );
+        return FALSE;
+    }
+    pthread_detach( thread );
+
+    glp_vtest_fd = fd;
+    glp_chained_listener = p_obelisk_wsd_get_release_listener();
+    p_obelisk_wsd_set_release_listener( glp_release_listener );
+    glp_disabled = FALSE;
+    return TRUE;
+}
+
+/* attaches a buffer to the render server's present chain; the server answers 0 or a negative errno */
+static BOOL glp_attach_to_server( UINT64 token, UINT index, int width, int height, UINT stride, SIZE_T size, int fd )
+{
+    UINT32 cmd[VTEST_HDR_SIZE + 9], reply[VTEST_HDR_SIZE + 1];
+    char byte = 0;
+    char control[CMSG_SPACE(sizeof(int))] = { 0 };
+    struct iovec iov = { .iov_base = &byte, .iov_len = 1 };
+    struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1, .msg_control = control, .msg_controllen = sizeof(control) };
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR( &msg );
+
+    cmd[0] = 9;
+    cmd[1] = VCMD_OBELISK_PRESENT_ATTACH;
+    cmd[2] = (UINT32)token;
+    cmd[3] = (UINT32)(token >> 32);
+    cmd[4] = index;
+    cmd[5] = width;
+    cmd[6] = height;
+    cmd[7] = stride;
+    cmd[8] = WSD_FMT_BGRA8;
+    cmd[9] = (UINT32)size;
+    cmd[10] = (UINT32)((UINT64)size >> 32);
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type = SCM_RIGHTS;
+    cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy( CMSG_DATA(cmsg), &fd, sizeof(int) );
+    pthread_mutex_lock( &glp_server_lock );
+    if (glp_vtest_fd < 0 || !glp_write_all( glp_vtest_fd, cmd, sizeof(cmd) ) || sendmsg( glp_vtest_fd, &msg, 0 ) != 1 ||
+        !glp_read_all( glp_vtest_fd, reply, sizeof(reply) ) || reply[1] != VCMD_OBELISK_PRESENT_ATTACH)
+    {
+        ERR( "the render server connection failed: %s\n", strerror( errno ) );
+        if (glp_vtest_fd >= 0) close( glp_vtest_fd );
+        glp_vtest_fd = -1;
+        pthread_mutex_unlock( &glp_server_lock );
+        glp_disabled = TRUE;
+        return FALSE;
+    }
+    pthread_mutex_unlock( &glp_server_lock );
+    if (reply[2])
+    {
+        WARN( "the render server refused buffer %u: %d\n", index, (int)reply[2] );
+        return FALSE;
+    }
+    return TRUE;
+}
+
+/* the end of the drawable's chain on the render server, whose buffers go there too */
+static void glp_detach_from_server( UINT64 token )
+{
+    UINT32 cmd[VTEST_HDR_SIZE + 2], reply[VTEST_HDR_SIZE + 1];
+
+    cmd[0] = 2;
+    cmd[1] = VCMD_OBELISK_PRESENT_DETACH;
+    cmd[2] = (UINT32)token;
+    cmd[3] = (UINT32)(token >> 32);
+    pthread_mutex_lock( &glp_server_lock );
+    if (glp_vtest_fd >= 0 && (!glp_write_all( glp_vtest_fd, cmd, sizeof(cmd) ) ||
+        !glp_read_all( glp_vtest_fd, reply, sizeof(reply) ) || reply[1] != VCMD_OBELISK_PRESENT_DETACH))
+    {
+        ERR( "the render server connection failed: %s\n", strerror( errno ) );
+        close( glp_vtest_fd );
+        glp_vtest_fd = -1;
+        glp_disabled = TRUE;
+    }
+    pthread_mutex_unlock( &glp_server_lock );
+}
+
+static void glp_free_buffers( struct gl_present *present )
+{
+    UINT i;
+    glp_drain();
+    for (i = 0; i < GLP_BUFFERS; i++)
+    {
+        struct gl_present_buffer *buf = &present->buf[i];
+        if (!buf->map) continue;
+        if (p_obelisk_wsd_send)
+        {
+            struct wsd_buffer detach = { buf->wsd_id };
+            p_obelisk_wsd_send( WSD_BUFFER_DETACH, &detach, sizeof(detach), -1 );
+        }
+        munmap( buf->map, buf->size );
+        pthread_mutex_lock( &glp_lock );
+        glp_slots[buf->slot].id = 0;
+        glp_slots[buf->slot].busy = FALSE;
+        glp_slots[buf->slot].present = NULL;
+        pthread_mutex_unlock( &glp_lock );
+        memset( buf, 0, sizeof(*buf) );
+    }
+}
+
+static BOOL glp_alloc_buffers( struct gl_present *present, int width, int height )
+{
+    UINT stride = (width * 4 + GLP_STRIDE_ALIGN - 1) & ~(GLP_STRIDE_ALIGN - 1);
+    SIZE_T size = ((SIZE_T)stride * height + GLP_TRAILER_SIZE + GLP_SHM_ALIGN - 1) & ~(SIZE_T)(GLP_SHM_ALIGN - 1);
+    UINT i, gen;
+
+    glp_free_buffers( present );
+    pthread_mutex_lock( &glp_lock );
+    gen = ++glp_generation;
+    pthread_mutex_unlock( &glp_lock );
+    /* one chain per drawable: a new size replaces its buffers on the render server */
+    if (!present->token) present->token = ((UINT64)getpid() << 32) | gen;
+
+    for (i = 0; i < GLP_BUFFERS; i++)
+    {
+        struct gl_present_buffer *buf = &present->buf[i];
+        struct wsd_buffer_attach attach;
+        int fd, slot;
+        void *map;
+
+        pthread_mutex_lock( &glp_lock );
+        for (slot = 0; slot < GLP_SLOTS && glp_slots[slot].id; slot++) ;
+        if (slot < GLP_SLOTS)
+        {
+            glp_slots[slot].id = GLP_ID_TAG | (gen & 0xfffff) << 4 | i;
+            glp_slots[slot].present = present;
+        }
+        pthread_mutex_unlock( &glp_lock );
+        if (slot == GLP_SLOTS) goto failed;
+
+        if ((fd = syscall( __NR_memfd_create, "wine-gl-present", 1 /* MFD_CLOEXEC */ )) < 0) goto failed_slot;
+        if (ftruncate( fd, size ) < 0 ||
+            (map = mmap( NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0 )) == MAP_FAILED)
+        {
+            close( fd );
+            goto failed_slot;
+        }
+        buf->map = map;
+        buf->size = size;
+        buf->stride = stride;
+        buf->slot = slot;
+        buf->wsd_id = glp_slots[slot].id;
+
+        memset( &attach, 0, sizeof(attach) );
+        attach.buffer_id = buf->wsd_id;
+        attach.width = width;
+        attach.height = height;
+        attach.stride = stride;
+        attach.format = WSD_FMT_BGRA8;
+        attach.size = (UINT64)stride * height;
+        if (!p_obelisk_wsd_send( WSD_BUFFER_ATTACH, &attach, sizeof(attach), fd ) ||
+            !glp_attach_to_server( present->token, i, width, height, stride, size, fd ))
+        {
+            close( fd );
+            goto failed;
+        }
+        close( fd );
+        continue;
+
+    failed_slot:
+        pthread_mutex_lock( &glp_lock );
+        glp_slots[slot].id = 0;
+        glp_slots[slot].present = NULL;
+        pthread_mutex_unlock( &glp_lock );
+        goto failed;
+    }
+    present->width = width;
+    present->height = height;
+    present->next = 0;
+    return TRUE;
+
+failed:
+    glp_free_buffers( present );
+    present->width = present->height = 0;
+    return FALSE;
+}
+
+/* The present's GL objects belong to the context that draws: framebuffer objects are not shared between contexts,
+ * and a new context may have the address of the one it replaced. They go when the context lets go of the drawable,
+ * with that context current, and the next swap makes them again. */
+static void gl_present_forget_context( struct gl_present *present )
+{
+    const struct opengl_funcs *funcs = &display_funcs;
+
+    if (!present) return;
+    if (present->texture) funcs->p_glDeleteTextures( 1, &present->texture );
+    if (present->fbo) funcs->p_glDeleteFramebuffers( 1, &present->fbo );
+    if (present->src_fbo) funcs->p_glDeleteFramebuffers( 1, &present->src_fbo );
+    present->texture = present->fbo = present->src_fbo = 0;
+    present->texture_width = present->texture_height = 0;
+    present->context = NULL;
+}
+
+static void gl_present_destroy( struct gl_present *present )
+{
+    if (!present) return;
+    glp_drain();
+    if (present->window_id && p_obelisk_wsd_send)
+    {
+        struct wsd_present_region region = { .present.window_id = present->window_id };
+        p_obelisk_wsd_send( WSD_PRESENT_REGION, &region, sizeof(region), -1 ); /* 0x0: no overlay plane */
+    }
+    glp_free_buffers( present );
+    if (present->token) glp_detach_from_server( present->token );
+    /* the GL objects go with their context */
+    free( present );
+}
+
+/* returns TRUE when the frame was shown (or dropped on purpose), FALSE to read it back as before */
+static BOOL gl_present_swap( struct framebuffer_surface *surface, HWND hwnd, int width, int height )
+{
+    static const WCHAR obelisk_window_propW[] = {'_','_','w','i','n','e','_','o','b','e','l','i','s','k','_','w','i','n','d','o','w',0};
+    const struct opengl_funcs *funcs = &display_funcs;
+    struct opengl_drawable *drawable = &surface->base;
+    struct gl_present *present = surface->present;
+    struct gl_present_buffer *buf = NULL;
+    struct timespec deadline;
+    struct glp_job job;
+    GLboolean scissor, discard;
+    GLint renderbuffer = 0;
+    UINT window_id, i;
+    char marker[96];
+    int len;
+    void *context = NtCurrentTeb()->glContext;
+
+    pthread_mutex_lock( &glp_lock );
+    if (!glp_init())
+    {
+        pthread_mutex_unlock( &glp_lock );
+        return FALSE;
+    }
+    pthread_mutex_unlock( &glp_lock );
+
+    if (!(window_id = HandleToULong( NtUserGetProp( NtUserGetAncestor( hwnd, GA_ROOT ), obelisk_window_propW ) )))
+        return FALSE;
+    if (!present)
+    {
+        if (!funcs->p_glDebugMessageInsert || !funcs->p_glBlitNamedFramebuffer || !funcs->p_glCreateTextures ||
+            !funcs->p_glTextureStorage2D || !funcs->p_glNamedFramebufferTexture)
+        {
+            WARN( "frames read back: framebuffer functions missing\n" );
+            pthread_mutex_lock( &glp_lock );
+            glp_disabled = TRUE;
+            pthread_mutex_unlock( &glp_lock );
+            return FALSE;
+        }
+        if (!(present = surface->present = calloc( 1, sizeof(*present) ))) return FALSE;
+    }
+    present->window_id = window_id;
+
+    if ((present->width != width || present->height != height) && !glp_alloc_buffers( present, width, height ))
+        return FALSE;
+
+    /* the texture the back buffer is blitted into, in the context that draws now (framebuffer objects are not
+     * shared between contexts; those of a previous context stay with it) */
+    if (present->context != context)
+    {
+        present->texture = present->fbo = present->src_fbo = 0;
+        present->texture_width = present->texture_height = 0;
+        present->context = context;
+    }
+    if (present->texture_width != width || present->texture_height != height)
+    {
+        if (present->texture) funcs->p_glDeleteTextures( 1, &present->texture );
+        funcs->p_glCreateTextures( GL_TEXTURE_2D, 1, &present->texture );
+        funcs->p_glTextureStorage2D( present->texture, 1, GL_RGBA8, width, height );
+        if (!present->fbo) funcs->p_glCreateFramebuffers( 1, &present->fbo );
+        funcs->p_glNamedFramebufferTexture( present->fbo, GL_COLOR_ATTACHMENT0, present->texture, 0 );
+        if (!present->src_fbo) funcs->p_glCreateFramebuffers( 1, &present->src_fbo );
+        present->texture_width = width;
+        present->texture_height = height;
+    }
+
+    /* a free buffer: wsd keeps the one it shows and may hold the next until its display tick, and the present thread
+     * one it waits for; up to 20 ms */
+    clock_gettime( CLOCK_REALTIME, &deadline );
+    if ((deadline.tv_nsec += 20000000) >= 1000000000)
+    {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000;
+    }
+    pthread_mutex_lock( &glp_lock );
+    for (;;)
+    {
+        for (i = 0; i < GLP_BUFFERS && !buf; i++)
+        {
+            struct gl_present_buffer *candidate = &present->buf[(present->next + i) % GLP_BUFFERS];
+            if (!glp_slots[candidate->slot].busy) buf = candidate;
+        }
+        if (buf || glp_disabled || pthread_cond_timedwait( &glp_free_cond, &glp_lock, &deadline ) == ETIMEDOUT) break;
+    }
+    if (buf) glp_slots[buf->slot].busy = TRUE;
+    pthread_mutex_unlock( &glp_lock );
+    if (!buf) return !glp_disabled; /* wsd holds them all (the window is hidden): the frame is dropped */
+
+    funcs->p_glGetNamedFramebufferAttachmentParameteriv( drawable->read_fbo,
+                                                         drawable->doublebuffer ? GL_COLOR_ATTACHMENT1 : GL_COLOR_ATTACHMENT0,
+                                                         GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &renderbuffer );
+    funcs->p_glNamedFramebufferRenderbuffer( present->src_fbo, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, renderbuffer );
+    funcs->p_glNamedFramebufferReadBuffer( present->src_fbo, GL_COLOR_ATTACHMENT0 );
+    scissor = funcs->p_glIsEnabled( GL_SCISSOR_TEST );
+    discard = funcs->p_glIsEnabled( GL_RASTERIZER_DISCARD );
+    if (scissor) funcs->p_glDisable( GL_SCISSOR_TEST );
+    if (discard) funcs->p_glDisable( GL_RASTERIZER_DISCARD );
+    funcs->p_glBlitNamedFramebuffer( present->src_fbo, present->fbo, 0, 0, width, height, 0, 0, width, height,
+                                     GL_COLOR_BUFFER_BIT, GL_NEAREST );
+    if (discard) funcs->p_glEnable( GL_RASTERIZER_DISCARD );
+    if (scissor) funcs->p_glEnable( GL_SCISSOR_TEST );
+
+    i = buf - present->buf;
+    len = snprintf( marker, sizeof(marker), "obelisk-present token=%llx buf=%u serial=%llu",
+                    (unsigned long long)present->token, i, (unsigned long long)++present->serial );
+    /* a debug marker reaches the driver in command order (Mesa: emit_string_marker), not only the debug log */
+    funcs->p_glDebugMessageInsert( GL_DEBUG_SOURCE_APPLICATION, GL_DEBUG_TYPE_MARKER, 0, GL_DEBUG_SEVERITY_NOTIFICATION,
+                                   len, marker );
+    funcs->p_glFlush();
+
+    /* the present thread shows the buffer once the render server has stamped the serial into its trailer */
+    job.trailer = (const UINT8 *)buf->map + (SIZE_T)buf->stride * height;
+    job.serial = present->serial;
+    job.window_id = window_id;
+    job.buffer_id = buf->wsd_id;
+    job.slot = buf->slot;
+    job.width = width;
+    job.height = height;
+    pthread_mutex_lock( &glp_lock );
+    while (glp_job_count == GLP_JOBS) pthread_cond_wait( &glp_free_cond, &glp_lock );
+    glp_jobs[(glp_job_head + glp_job_count) % GLP_JOBS] = job;
+    glp_job_count++;
+    pthread_cond_signal( &glp_job_cond );
+    pthread_mutex_unlock( &glp_lock );
+
+    present->next = (i + 1) % GLP_BUFFERS;
+    if (!present->presents++) TRACE( "first frame sent without a readback, %dx%d\n", width, height );
+    return TRUE;
+}
+
 /* A window drawable of a driver that gives windows no GL surface of their own (the surfaceless EGL path) is this
  * framebuffer object, which nothing shows. On swap, copy its back buffer into the window through GDI, as the
  * window surface's pixels, and flush the window surfaces so that the driver presents the frame now. */
@@ -418,6 +1071,13 @@ static BOOL framebuffer_surface_swap( struct opengl_drawable *drawable )
     if (!drawable->read_fbo) return TRUE;
     NtUserGetClientRect( hwnd, &rect, NtUserGetDpiForWindow( hwnd ) );
     if ((width = rect.right) <= 0 || (height = rect.bottom) <= 0) return TRUE;
+    if (glp_failed_serial && !glp_failure_logged)
+    {
+        glp_failure_logged = TRUE;
+        ERR( "the render server did not confirm frame %llu; frames are read back from now on\n",
+             (unsigned long long)glp_failed_serial );
+    }
+    if (!glp_disabled && gl_present_swap( surface, hwnd, width, height )) return TRUE;
     if (surface->bits_size < (SIZE_T)width * height * 4)
     {
         free( surface->bits );
@@ -2589,17 +3249,22 @@ static void display_funcs_init(void)
         WARN( "%s not found.\n", #func );
     ALL_GL_FUNCS
     USE_GL_FUNC(glBindBuffer)
+    USE_GL_FUNC(glBlitNamedFramebuffer)
     USE_GL_FUNC(glBindFramebuffer)
     USE_GL_FUNC(glCheckNamedFramebufferStatus)
     USE_GL_FUNC(glCreateFramebuffers)
     USE_GL_FUNC(glCreateRenderbuffers)
+    USE_GL_FUNC(glCreateTextures)
+    USE_GL_FUNC(glDebugMessageInsert)
     USE_GL_FUNC(glDeleteFramebuffers)
     USE_GL_FUNC(glDeleteRenderbuffers)
     USE_GL_FUNC(glGetNamedFramebufferAttachmentParameteriv)
     USE_GL_FUNC(glNamedFramebufferDrawBuffer)
     USE_GL_FUNC(glNamedFramebufferReadBuffer)
     USE_GL_FUNC(glNamedFramebufferRenderbuffer)
+    USE_GL_FUNC(glNamedFramebufferTexture)
     USE_GL_FUNC(glNamedRenderbufferStorageMultisample)
+    USE_GL_FUNC(glTextureStorage2D)
 #undef USE_GL_FUNC
 
     display_funcs.p_wglGetProcAddress = win32u_wglGetProcAddress;
