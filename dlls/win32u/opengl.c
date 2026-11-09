@@ -425,7 +425,13 @@ static void framebuffer_surface_flush( struct opengl_drawable *drawable, UINT fl
  * render server's support (a frame not confirmed), swaps read the frame back as before.
  *
  * The present thread is a plain thread, not a Win32 one: it only reads memory and writes to wsd's socket, and uses no
- * Wine debug output. */
+ * Wine debug output.
+ *
+ * A frame lock (the FrameLock value of HKCU\Software\Wine\OpenGL or AppDefaults\app.exe\OpenGL, or WINE_GL_FRAME_LOCK:
+ * n refreshes a frame) has wsd show the window's frames at the refresh of its screen divided by n, on its ticks, and
+ * makes each swap wait until the frame before it has been shown, so the game draws exactly one frame per interval:
+ * motion is even when the game cannot keep up with every refresh (75-90 FPS on a 120 or 144 Hz screen shows frames for
+ * one or two refreshes in turn). */
 
 #define GLP_BUFFERS        6  /* wsd holds two (shown, next); one is copied, one drawn into */
 #define GLP_STRIDE_ALIGN   256
@@ -463,6 +469,8 @@ struct gl_present
     int    texture_width, texture_height;
     void  *context;      /* the GL context the objects above belong to */
     UINT   presents;
+    UINT64 queued, done;   /* frames given to the present thread; frames wsd has released or that were not shown */
+    UINT   lock_window;    /* the window wsd was given the frame lock for */
 };
 
 /* a frame for the present thread: the buffer it is shown in once its trailer has the serial */
@@ -489,6 +497,7 @@ static BOOL glp_tried, glp_disabled, glp_failure_logged;
 static int glp_vtest_fd = -1;
 static UINT glp_generation;
 static struct { UINT id; BOOL busy; struct gl_present *present; } glp_slots[GLP_SLOTS];
+static UINT glp_frame_lock;               /* refreshes a frame (0: no lock), read once per process */
 static BOOL (*p_obelisk_wsd_send)( UINT type, const void *payload, UINT len, int fd );
 static void (*p_obelisk_wsd_set_release_listener)( void (*listener)( UINT, UINT, UINT64 ) );
 static void *(*p_obelisk_wsd_get_release_listener)(void);
@@ -509,6 +518,7 @@ static void glp_release_listener( UINT buffer_id, UINT shown, UINT64 serial )
     {
         if (glp_slots[i].id != buffer_id) continue;
         glp_slots[i].busy = FALSE;
+        if (glp_slots[i].present) glp_slots[i].present->done++;
     }
     pthread_cond_broadcast( &glp_free_cond );
     pthread_mutex_unlock( &glp_lock );
@@ -600,6 +610,7 @@ static void *glp_present_thread( void *arg )
         if (!shown)  /* wsd releases the ones it was given */
         {
             glp_slots[job.slot].busy = FALSE;
+            if (glp_slots[job.slot].present) glp_slots[job.slot].present->done++;
         }
         if (failed && !glp_disabled)
         {
@@ -651,6 +662,68 @@ static BOOL glp_read_all( int fd, void *data, size_t size )
         size -= ret;
     }
     return TRUE;
+}
+
+static UINT glp_reg_uint( HKEY key, const char *name, UINT def )
+{
+    char buffer[256];
+    KEY_VALUE_PARTIAL_INFORMATION *info = (void *)buffer;
+    UINT value = 0, size = query_reg_ascii_value( key, name, info, sizeof(buffer) );
+    const WCHAR *str = (const WCHAR *)info->Data;
+
+    if (!size) return def;
+    if (info->Type == REG_DWORD && size == sizeof(DWORD)) return *(const DWORD *)info->Data;
+    if (info->Type != REG_SZ) return def;
+    for (; size >= sizeof(WCHAR) && *str >= '0' && *str <= '9'; str++, size -= sizeof(WCHAR))
+        value = value * 10 + *str - '0';
+    return value;
+}
+
+/* FrameLock: 0 for none; 1 to 8, every frame stays for that many refreshes of the window's screen; 20 and above, the
+ * highest rate in frames a second: wsd picks the steady rate for the screen, and a slower one if the game can't keep up */
+#define GLP_LOCK_MAX_REFRESHES 8
+#define GLP_LOCK_MIN_FPS 20
+#define GLP_LOCK_MAX_FPS 240
+static UINT glp_lock_value( UINT lock )
+{
+    if (lock <= GLP_LOCK_MAX_REFRESHES) return lock;
+    if (lock < GLP_LOCK_MIN_FPS) return GLP_LOCK_MAX_REFRESHES;
+    return min( lock, GLP_LOCK_MAX_FPS );
+}
+
+static UINT glp_read_frame_lock(void)
+{
+    static const WCHAR openglW[] = {'\\','O','p','e','n','G','L',0};
+    const char *env = getenv( "WINE_GL_FRAME_LOCK" );
+    const WCHAR *appname, *p;
+    WCHAR appkey[MAX_PATH + ARRAY_SIZE(openglW)];
+    HKEY key, apps;
+    UINT lock = 0, len;
+
+    if (env) return glp_lock_value( (UINT)atoi( env ) );
+    /* @@ Wine registry key: HKCU\Software\Wine\OpenGL */
+    if ((key = reg_open_hkcu_key( "Software\\Wine\\OpenGL" )))
+    {
+        lock = glp_reg_uint( key, "FrameLock", lock );
+        NtClose( key );
+    }
+    /* @@ Wine registry key: HKCU\Software\Wine\AppDefaults\app.exe\OpenGL */
+    appname = NtCurrentTeb()->Peb->ProcessParameters->ImagePathName.Buffer;
+    if (appname && (p = wcsrchr( appname, '/' ))) appname = p + 1;
+    if (appname && (p = wcsrchr( appname, '\\' ))) appname = p + 1;
+    if (appname && (len = lstrlenW( appname )) && len < MAX_PATH &&
+        (apps = reg_open_hkcu_key( "Software\\Wine\\AppDefaults" )))
+    {
+        memcpy( appkey, appname, len * sizeof(WCHAR) );
+        memcpy( appkey + len, openglW, sizeof(openglW) );
+        if ((key = reg_open_key( apps, appkey, lstrlenW( appkey ) * sizeof(WCHAR) )))
+        {
+            lock = glp_reg_uint( key, "FrameLock", lock );
+            NtClose( key );
+        }
+        NtClose( apps );
+    }
+    return glp_lock_value( lock );
 }
 
 /* the display driver's wsd connection and a connection of our own to the render server, once per process */
@@ -716,6 +789,8 @@ static BOOL glp_init(void)
     pthread_detach( thread );
 
     glp_vtest_fd = fd;
+    if ((glp_frame_lock = glp_read_frame_lock()))
+        TRACE( "frame lock value %u\n", glp_frame_lock );
     glp_chained_listener = p_obelisk_wsd_get_release_listener();
     p_obelisk_wsd_set_release_listener( glp_release_listener );
     glp_disabled = FALSE;
@@ -880,6 +955,9 @@ static BOOL glp_alloc_buffers( struct gl_present *present, int width, int height
     present->width = width;
     present->height = height;
     present->next = 0;
+    pthread_mutex_lock( &glp_lock );
+    present->queued = present->done = 0; /* the old buffers' frames are gone with them */
+    pthread_mutex_unlock( &glp_lock );
     return TRUE;
 
 failed:
@@ -960,6 +1038,11 @@ static BOOL gl_present_swap( struct framebuffer_surface *surface, HWND hwnd, int
         if (!(present = surface->present = calloc( 1, sizeof(*present) ))) return FALSE;
     }
     present->window_id = window_id;
+    if (glp_frame_lock && present->lock_window != window_id)
+    {
+        struct wsd_window_flag rate = { window_id, (glp_frame_lock > GLP_LOCK_MAX_REFRESHES ? WSD_FRAME_RATE_AUTO : WSD_FRAME_RATE_DIVISOR) | glp_frame_lock };
+        if (p_obelisk_wsd_send( WSD_SET_FRAME_RATE, &rate, sizeof(rate), -1 )) present->lock_window = window_id;
+    }
 
     if ((present->width != width || present->height != height) && !glp_alloc_buffers( present, width, height ))
         return FALSE;
@@ -1037,9 +1120,25 @@ static BOOL gl_present_swap( struct framebuffer_surface *surface, HWND hwnd, int
     job.width = width;
     job.height = height;
     pthread_mutex_lock( &glp_lock );
+    if (glp_frame_lock)
+    {
+        /* One frame waits for the screen at a time: this one goes to wsd once a display tick has taken the one before
+         * it (wsd releases a buffer as soon as a tick has drawn it), up to 100 ms (a hidden window shows nothing). Sent
+         * earlier, it would replace that one unshown, since wsd keeps only the newest, and the game would run ahead of
+         * the lock. The render server copies this frame meanwhile. */
+        clock_gettime( CLOCK_REALTIME, &deadline );
+        if ((deadline.tv_nsec += 100000000) >= 1000000000)
+        {
+            deadline.tv_sec++;
+            deadline.tv_nsec -= 1000000000;
+        }
+        while (present->queued != present->done && !glp_disabled &&
+               pthread_cond_timedwait( &glp_free_cond, &glp_lock, &deadline ) != ETIMEDOUT) ;
+    }
     while (glp_job_count == GLP_JOBS) pthread_cond_wait( &glp_free_cond, &glp_lock );
     glp_jobs[(glp_job_head + glp_job_count) % GLP_JOBS] = job;
     glp_job_count++;
+    present->queued++;
     pthread_cond_signal( &glp_job_cond );
     pthread_mutex_unlock( &glp_lock );
 
