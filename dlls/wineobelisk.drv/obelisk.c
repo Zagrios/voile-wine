@@ -965,8 +965,11 @@ static BOOL OBELISK_SystemParametersInfo( UINT action, UINT int_param, void *ptr
  */
 static UINT OBELISK_UpdateDisplayDevices( const struct gdi_device_manager *manager, void *param )
 {
+    /* Smaller modes in the shape of each usual screen, 4:3, 16:9, 16:10 as a MacBook's and 21:9 as an ultrawide
+     * monitor's, so a game finds one that fills the screen it is on without stretching. */
     static const struct { UINT w, h; } extra[] = { {640,480}, {800,600}, {1024,768}, {1280,720}, {1280,800},
-                                                     {1600,900}, {1920,1080}, {2560,1440} };
+                                                     {1440,900}, {1600,900}, {1680,1050}, {1920,1080}, {1920,1200},
+                                                     {2560,1080}, {2560,1440}, {2560,1600}, {3440,1440} };
     struct pci_id pci_id = { 0 };
     struct gdi_monitor monitor = { 0 };
     DEVMODEW current = { .dmSize = sizeof(current) }, modes[ARRAY_SIZE(extra) + 2];
