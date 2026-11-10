@@ -32,6 +32,7 @@
 #include "initguid.h"
 
 #include "codecapi.h"
+#include "d3d11.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(mfplat);
 WINE_DECLARE_DEBUG_CHANNEL(winediag);
@@ -106,6 +107,7 @@ struct video_decoder
 
     IMFVideoSampleAllocatorEx *allocator;
     BOOL allocator_initialized;
+    IUnknown *device_manager;
     IMFTransform *copier;
     IMFMediaBuffer *temp_buffer;
 
@@ -168,6 +170,8 @@ static ULONG WINAPI unknown_Release(IUnknown *iface)
     {
         IMFTransform_Release(decoder->copier);
         IMFVideoSampleAllocatorEx_Release(decoder->allocator);
+        if (decoder->device_manager)
+            IUnknown_Release(decoder->device_manager);
         if (decoder->temp_buffer)
             IMFMediaBuffer_Release(decoder->temp_buffer);
         if (decoder->wg_transform)
@@ -438,12 +442,68 @@ done:
     return hr;
 }
 
+/* Whether the device of a manager can make textures of the frames of a type, which is what
+ * the allocator makes its samples of once it has the manager. Neither DXMT nor D3DMetal has
+ * the video formats: asked for such a texture, DXMT fails and D3DMetal stops the process, so
+ * the device is asked what it supports and never for a texture. A Direct3D 9 manager, and a
+ * manager that has no device yet, are taken as they always were. */
+static BOOL device_manager_holds_type(IUnknown *device_manager, IMFMediaType *type)
+{
+    IMFDXGIDeviceManager *manager;
+    ID3D11Device *device;
+    BOOL holds = TRUE;
+    HANDLE handle;
+    GUID subtype;
+    UINT support;
+
+    if (FAILED(IMFMediaType_GetGUID(type, &MF_MT_SUBTYPE, &subtype)))
+        return TRUE;
+    if (FAILED(IUnknown_QueryInterface(device_manager, &IID_IMFDXGIDeviceManager, (void **)&manager)))
+        return TRUE;
+
+    if (SUCCEEDED(IMFDXGIDeviceManager_OpenDeviceHandle(manager, &handle)))
+    {
+        if (SUCCEEDED(IMFDXGIDeviceManager_GetVideoService(manager, handle, &IID_ID3D11Device, (void **)&device)))
+        {
+            DXGI_FORMAT format = MFMapDX9FormatToDXGIFormat(subtype.Data1);
+
+            holds = format != DXGI_FORMAT_UNKNOWN
+                    && SUCCEEDED(ID3D11Device_CheckFormatSupport(device, format, &support))
+                    && (support & D3D11_FORMAT_SUPPORT_TEXTURE2D);
+            ID3D11Device_Release(device);
+        }
+        IMFDXGIDeviceManager_CloseDeviceHandle(manager, handle);
+    }
+
+    IMFDXGIDeviceManager_Release(manager);
+    return holds;
+}
+
+static void set_device_manager(struct video_decoder *decoder, IUnknown *device_manager)
+{
+    if (device_manager)
+        IUnknown_AddRef(device_manager);
+    if (decoder->device_manager)
+        IUnknown_Release(decoder->device_manager);
+    decoder->device_manager = device_manager;
+}
+
 static HRESULT init_allocator(struct video_decoder *decoder)
 {
     HRESULT hr;
 
     if (decoder->allocator_initialized)
         return S_OK;
+
+    /* The manager came before the output type, or the type changed since: the samples are
+     * made in system memory, as they are without a manager. */
+    if (decoder->device_manager && !device_manager_holds_type(decoder->device_manager, decoder->output_type))
+    {
+        WARN("The device cannot make textures of the output type, decoding to system memory.\n");
+        if (FAILED(hr = IMFVideoSampleAllocatorEx_SetDirectXManager(decoder->allocator, NULL)))
+            return hr;
+        set_device_manager(decoder, NULL);
+    }
 
     if (FAILED(hr = IMFTransform_SetInputType(decoder->copier, 0, decoder->output_type, 0)))
         return hr;
@@ -863,8 +923,17 @@ static HRESULT WINAPI transform_ProcessMessage(IMFTransform *iface, MFT_MESSAGE_
     switch (message)
     {
     case MFT_MESSAGE_SET_D3D_MANAGER:
+        /* Refused, the decoder stays as it was: without a manager, its caller brings the
+         * samples, in system memory. */
+        if (param && decoder->output_type && !device_manager_holds_type((IUnknown *)param, decoder->output_type))
+        {
+            WARN("The device cannot make textures of the output type, refusing its manager.\n");
+            return MF_E_UNSUPPORTED_D3D_TYPE;
+        }
+
         if (FAILED(hr = IMFVideoSampleAllocatorEx_SetDirectXManager(decoder->allocator, (IUnknown *)param)))
             return hr;
+        set_device_manager(decoder, (IUnknown *)param);
 
         uninit_allocator(decoder);
         if (param)
