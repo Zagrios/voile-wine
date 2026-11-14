@@ -56,7 +56,10 @@ static void test_NetworkInformationStatics(void)
     IConnectionProfile2 *connection_profile2;
     NetworkConnectivityLevel network_connectivity_level;
     IActivationFactory *factory = (void *)0xdeadbeef;
+    IConnectionCost *connection_cost;
+    NetworkCostType network_cost_type;
     NLM_CONNECTIVITY connectivity;
+    boolean value;
     HSTRING str;
     HRESULT hr;
     LONG ref;
@@ -186,6 +189,37 @@ static void test_NetworkInformationStatics(void)
         ok( network_connectivity_level == NetworkConnectivityLevel_LocalAccess, "got network_connectivity_level %d.\n", network_connectivity_level );
     else
         ok( network_connectivity_level == NetworkConnectivityLevel_ConstrainedInternetAccess, "got network_connectivity_level %d.\n", network_connectivity_level );
+
+    hr = IConnectionProfile_GetConnectionCost( connection_profile, &connection_cost );
+    ok( hr == S_OK, "got hr %#lx.\n", hr );
+    if (hr == S_OK)
+    {
+        check_interface( connection_cost, &IID_IUnknown );
+        check_interface( connection_cost, &IID_IInspectable );
+        check_interface( connection_cost, &IID_IAgileObject );
+        check_interface( connection_cost, &IID_IConnectionCost );
+
+        network_cost_type = 0xdeadbeef;
+        hr = IConnectionCost_get_NetworkCostType( connection_cost, &network_cost_type );
+        ok( hr == S_OK, "got hr %#lx.\n", hr );
+        ok( network_cost_type >= NetworkCostType_Unknown && network_cost_type <= NetworkCostType_Variable,
+            "got network_cost_type %d.\n", network_cost_type );
+
+        value = 0xff;
+        hr = IConnectionCost_get_Roaming( connection_cost, &value );
+        ok( hr == S_OK, "got hr %#lx.\n", hr );
+        ok( value == TRUE || value == FALSE, "got value %d.\n", value );
+        value = 0xff;
+        hr = IConnectionCost_get_OverDataLimit( connection_cost, &value );
+        ok( hr == S_OK, "got hr %#lx.\n", hr );
+        ok( value == TRUE || value == FALSE, "got value %d.\n", value );
+        value = 0xff;
+        hr = IConnectionCost_get_ApproachingDataLimit( connection_cost, &value );
+        ok( hr == S_OK, "got hr %#lx.\n", hr );
+        ok( value == TRUE || value == FALSE, "got value %d.\n", value );
+
+        IConnectionCost_Release( connection_cost );
+    }
 
     ref = IConnectionProfile_Release( connection_profile );
     ok( ref == 0, "got ref %ld.\n", ref );
