@@ -12,6 +12,9 @@
  * connection is the one of wineobelisk.drv in the same process, reached through its exported functions.
  * The x11_window field of npt_unix_wsi_init_params carries the wsd window id (HWND property
  * __wine_obelisk_window, set by the display driver).
+ *
+ * Every swapchain has a state of its own, named by the handle wsi_init returns (the wsi field, as in neptune's X11
+ * unixlib): a game that shows a second swapchain in another window (a popup) keeps presenting into the first.
  */
 #define _GNU_SOURCE
 #include <dlfcn.h>
@@ -41,8 +44,11 @@ static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_cond = PTHREAD_COND_INITIALIZER;
 static unsigned int g_generation;
 
-static struct {
+#define NPT_WSI_MAX_STATES 16
+
+struct wsi_state {
    bool active;
+   uint64_t handle;             /* the wsi handle of the swapchain, never 0 */
    uint32_t window_id;
    uint32_t num_images;
    uint32_t width, height;
@@ -56,7 +62,20 @@ static struct {
    uint64_t stat_fence_timeouts, stat_fence_ns, stat_pace_ns, stat_last_ns, stat_interval_ns, stat_pace_timeouts, stat_no_fence;
    uint64_t stat_presented;     /* EV_PRESENTED received */
    int rx, ry; uint32_t rw, rh; /* last overlay rectangle */
-} g_wsi;
+   uint64_t drains, last_log_ns;
+};
+
+static struct wsi_state g_states[NPT_WSI_MAX_STATES];
+static uint64_t g_next_handle;
+
+/* the state a call names, under g_lock; nothing for a destroyed handle or 0 (a swapchain whose wsi_init failed) */
+static struct wsi_state *state_of(uint64_t handle)
+{
+   if (!handle) return NULL;
+   for (uint32_t i = 0; i < NPT_WSI_MAX_STATES; i++)
+      if (g_states[i].active && g_states[i].handle == handle) return &g_states[i];
+   return NULL;
+}
 
 static uint64_t now_ns(void)
 {
@@ -92,14 +111,17 @@ static void on_release(unsigned int buffer_id, unsigned int shown, uint64_t seri
 {
    (void)shown;
    pthread_mutex_lock(&g_lock);
-   if (g_wsi.latch_serial && serial == g_wsi.latch_serial) {
-      g_wsi.latch_serial = 0;
-      pthread_cond_broadcast(&g_cond);
-   }
-   for (uint32_t i = 0; g_wsi.active && i < g_wsi.num_images; i++) {
-      if (g_wsi.buffer_ids[i] == buffer_id) {
-         g_wsi.released[i]++;
+   for (uint32_t k = 0; k < NPT_WSI_MAX_STATES; k++) {
+      struct wsi_state *s = &g_states[k];
+      if (s->latch_serial && serial == s->latch_serial) {
+         s->latch_serial = 0;
          pthread_cond_broadcast(&g_cond);
+      }
+      for (uint32_t i = 0; s->active && i < s->num_images; i++) {
+         if (s->buffer_ids[i] == buffer_id) {
+            s->released[i]++;
+            pthread_cond_broadcast(&g_cond);
+         }
       }
    }
    pthread_mutex_unlock(&g_lock);
@@ -110,11 +132,14 @@ static void on_presented(unsigned int buffer_id, uint64_t serial, uint64_t prese
 {
    (void)serial; (void)presented_ns;
    pthread_mutex_lock(&g_lock);
-   for (uint32_t i = 0; g_wsi.active && i < g_wsi.num_images; i++) {
-      if (g_wsi.buffer_ids[i] == buffer_id) g_wsi.stat_presented++;
-      if (g_wsi.buffer_ids[i] == buffer_id && g_wsi.in_flight) {
-         g_wsi.in_flight--;
-         pthread_cond_broadcast(&g_cond);
+   for (uint32_t k = 0; k < NPT_WSI_MAX_STATES; k++) {
+      struct wsi_state *s = &g_states[k];
+      for (uint32_t i = 0; s->active && i < s->num_images; i++) {
+         if (s->buffer_ids[i] == buffer_id) s->stat_presented++;
+         if (s->buffer_ids[i] == buffer_id && s->in_flight) {
+            s->in_flight--;
+            pthread_cond_broadcast(&g_cond);
+         }
       }
    }
    pthread_mutex_unlock(&g_lock);
@@ -131,17 +156,28 @@ static uint32_t wsd_format(uint32_t virgl_format)
    }
 }
 
-static void detach_all(void)
+/* whether another live swapchain presents into the window of s (a game that makes a new swapchain on its window
+ * before it releases the old one): the window's overlay is then that swapchain's. Under g_lock. */
+static bool window_shared(const struct wsi_state *s)
 {
-   for (uint32_t i = 0; i < g_wsi.num_images; i++) {
-      if (!g_wsi.buffer_ids[i]) continue;
-      struct wsd_buffer b = { g_wsi.buffer_ids[i] };
+   for (uint32_t k = 0; k < NPT_WSI_MAX_STATES; k++)
+      if (&g_states[k] != s && g_states[k].active && g_states[k].window_id == s->window_id) return true;
+   return false;
+}
+
+/* detaches the buffers of one state only, and empties the overlay of its own window unless another swapchain
+ * presents there */
+static void detach_all(const struct wsi_state *s, bool shared)
+{
+   for (uint32_t i = 0; i < s->num_images; i++) {
+      if (!s->buffer_ids[i]) continue;
+      struct wsd_buffer b = { s->buffer_ids[i] };
       p_send(WSD_BUFFER_DETACH, &b, sizeof(b), -1);
    }
-   if (g_wsi.window_id) {
+   if (s->window_id && !shared) {
       struct wsd_present_region r;
       memset(&r, 0, sizeof(r));
-      r.present.window_id = g_wsi.window_id;
+      r.present.window_id = s->window_id;
       p_send(WSD_PRESENT_REGION, &r, sizeof(r), -1);  /* 0x0: remove the overlay plane */
    }
 }
@@ -149,7 +185,10 @@ static void detach_all(void)
 NTSTATUS npt_do_wsi_init(void *args)
 {
    struct npt_unix_wsi_init_params *p = args;
+   struct wsi_state *s = NULL;
+   unsigned int generation;
    p->result = -1;
+   p->wsi = 0;
 
    if (!p->num_images || p->num_images > NPT_WSI_MAX_IMAGES) return STATUS_SUCCESS;
    if (!bind_driver()) return STATUS_SUCCESS;
@@ -159,13 +198,21 @@ NTSTATUS npt_do_wsi_init(void *args)
    }
 
    pthread_mutex_lock(&g_lock);
-   if (g_wsi.active) detach_all();
-   memset(&g_wsi, 0, sizeof(g_wsi));
-   g_generation = (g_generation + 1) & 0x7ffffff;
-   g_wsi.window_id = p->x11_window;
-   g_wsi.num_images = p->num_images;
-   g_wsi.width = p->width;
-   g_wsi.height = p->height;
+   /* a free state; the handle claims it, while it stays inactive until its buffers are attached below */
+   for (uint32_t i = 0; i < NPT_WSI_MAX_STATES && !s; i++)
+      if (!g_states[i].handle) s = &g_states[i];
+   if (!s) {
+      pthread_mutex_unlock(&g_lock);
+      fprintf(stderr, "neptune unixlib wsi (wsd): no free swapchain state (%u in use)\n", NPT_WSI_MAX_STATES);
+      return STATUS_SUCCESS;
+   }
+   memset(s, 0, sizeof(*s));
+   s->handle = ++g_next_handle;
+   generation = g_generation = (g_generation + 1) & 0x7ffffff; /* buffer ids unique across states and inits */
+   s->window_id = p->x11_window;
+   s->num_images = p->num_images;
+   s->width = p->width;
+   s->height = p->height;
    pthread_mutex_unlock(&g_lock);
    p_set_release_listener(on_release);
    p_set_presented_listener(on_presented);
@@ -174,7 +221,7 @@ NTSTATUS npt_do_wsi_init(void *args)
       struct wsd_buffer_attach a;
       if (p->fds[i] < 0) continue;
       memset(&a, 0, sizeof(a));
-      a.buffer_id = 0x80000000u | (g_generation << 4) | i;
+      a.buffer_id = 0x80000000u | (generation << 4) | i;
       a.width = p->width;
       a.height = p->height;
       a.stride = p->strides[i];
@@ -185,15 +232,16 @@ NTSTATUS npt_do_wsi_init(void *args)
          fprintf(stderr, "neptune unixlib wsi (wsd): BUFFER_ATTACH failed for image %u\n", i);
          continue;
       }
-      g_wsi.buffer_ids[i] = a.buffer_id;
+      s->buffer_ids[i] = a.buffer_id;
       fprintf(stderr, "neptune unixlib wsi (wsd): image %u -> buffer %#x (%ux%u stride %u format %u)\n",
               i, a.buffer_id, a.width, a.height, a.stride, a.format);
    }
    pthread_mutex_lock(&g_lock);
-   g_wsi.active = true;
+   s->active = true;
    pthread_mutex_unlock(&g_lock);
-   fprintf(stderr, "neptune unixlib wsi (wsd): initialized for wsd window %u (%u images, %ux%u)\n",
-           g_wsi.window_id, p->num_images, p->width, p->height);
+   fprintf(stderr, "neptune unixlib wsi (wsd): initialized for wsd window %u (%u images, %ux%u, swapchain %llu)\n",
+           s->window_id, p->num_images, p->width, p->height, (unsigned long long)s->handle);
+   p->wsi = s->handle;
    p->result = 0;
    return STATUS_SUCCESS;
 }
@@ -233,7 +281,7 @@ static void deadline_in_ms(struct timespec *deadline, long ms)
 }
 
 /* "latch": until wsd releases the frame sent last */
-static void latch_wait(void)
+static void latch_wait(struct wsi_state *s)
 {
    struct timespec deadline;
    int timedout = 0;
@@ -241,15 +289,15 @@ static void latch_wait(void)
    deadline_in_ms(&deadline, 100);
    pthread_mutex_lock(&g_lock);
    w0 = now_ns();
-   while (g_wsi.latch_serial && !timedout)
+   while (s->latch_serial && !timedout)
       timedout = pthread_cond_timedwait(&g_cond, &g_lock, &deadline) == ETIMEDOUT;
-   if (timedout) g_wsi.stat_pace_timeouts++;
-   g_wsi.stat_pace_ns += now_ns() - w0;
-   g_wsi.latch_serial = 0;
+   if (timedout) s->stat_pace_timeouts++;
+   s->stat_pace_ns += now_ns() - w0;
+   s->latch_serial = 0;
    pthread_mutex_unlock(&g_lock);
 }
 
-static void pace_wait(void)
+static void pace_wait(struct wsi_state *s)
 {
    {
       struct timespec deadline;
@@ -259,11 +307,11 @@ static void pace_wait(void)
       pthread_mutex_lock(&g_lock);
       uint64_t w0 = now_ns();
       int timedout = 0;
-      while (g_wsi.in_flight && !timedout)
+      while (s->in_flight && !timedout)
          timedout = pthread_cond_timedwait(&g_cond, &g_lock, &deadline) == ETIMEDOUT;
-      if (timedout) g_wsi.stat_pace_timeouts++;
-      g_wsi.stat_pace_ns += now_ns() - w0;
-      g_wsi.in_flight = 0;
+      if (timedout) s->stat_pace_timeouts++;
+      s->stat_pace_ns += now_ns() - w0;
+      s->in_flight = 0;
       pthread_mutex_unlock(&g_lock);
    }
 
@@ -273,11 +321,22 @@ NTSTATUS npt_do_wsi_present(void *args)
 {
    struct npt_unix_wsi_present_params *p = args;
    struct wsd_present pr;
+   struct wsi_state *s;
    uint64_t t0 = now_ns();
    int mode;
 
    p->result = -1;
    p->wait_fence_consumed = 0;
+   pthread_mutex_lock(&g_lock);
+   s = state_of(p->wsi);
+   pthread_mutex_unlock(&g_lock);
+   if (!s) {
+      /* a destroyed swapchain's present: never another swapchain's state */
+      if (p->wait_fence_fd >= 0) { close(p->wait_fence_fd); p->wait_fence_consumed = 1; }
+      fprintf(stderr, "neptune unixlib wsi (wsd): present of image %u for unknown swapchain %llu ignored\n",
+              p->image_index, (unsigned long long)p->wsi);
+      return STATUS_SUCCESS;
+   }
 
    /* wsd has no fenced present yet: wait here for the renderer's fence (end of the frame on the host). */
    if (p->wait_fence_fd >= 0) {
@@ -287,63 +346,65 @@ NTSTATUS npt_do_wsi_present(void *args)
        * possibly before the GPU finished it; counted in the statistics). */
       do rc = poll(&pfd, 1, 1000); while (rc < 0 && errno == EINTR);
       if (rc == 0) {
-         g_wsi.stat_fence_timeouts++;
+         s->stat_fence_timeouts++;
          fprintf(stderr, "neptune unixlib wsi (wsd): fence of present %llu not signaled after 1 s (image %u)\n",
-                 (unsigned long long)g_wsi.presents + 1, p->image_index);
+                 (unsigned long long)s->presents + 1, p->image_index);
       }
       close(p->wait_fence_fd);
       p->wait_fence_consumed = 1;
    }
-   else g_wsi.stat_no_fence++;
-   g_wsi.stat_fence_ns += now_ns() - t0;
-   if (!g_wsi.active || p->image_index >= g_wsi.num_images || !g_wsi.buffer_ids[p->image_index]) {
+   else s->stat_no_fence++;
+   s->stat_fence_ns += now_ns() - t0;
+   if (!s->active || p->image_index >= s->num_images || !s->buffer_ids[p->image_index]) {
       fprintf(stderr, "neptune unixlib wsi (wsd): present of image %u ignored (active %d, %u images)\n",
-              p->image_index, g_wsi.active, g_wsi.num_images);
+              p->image_index, s->active, s->num_images);
       return STATUS_SUCCESS;
    }
 
    mode = pacing_mode(p);
-   if (mode == 1) pace_wait();
+   if (mode == 1) pace_wait(s);
 
    /* the swapchain covers the client area of the window (Wine draws the frame): present into an overlay plane */
    {
       struct wsd_present_region r;
-      int x = 0, y = 0; unsigned int w = g_wsi.width, h = g_wsi.height;
-      if (!p_client_rect(g_wsi.window_id, &x, &y, &w, &h)) { x = y = 0; w = g_wsi.width; h = g_wsi.height; }
+      int x = 0, y = 0; unsigned int w = s->width, h = s->height;
+      if (!p_client_rect(s->window_id, &x, &y, &w, &h)) { x = y = 0; w = s->width; h = s->height; }
       memset(&r, 0, sizeof(r));
-      r.present.window_id = g_wsi.window_id;
-      r.present.buffer_id = g_wsi.buffer_ids[p->image_index];
+      r.present.window_id = s->window_id;
+      r.present.buffer_id = s->buffer_ids[p->image_index];
       r.present.serial = p_next_serial();
       r.present.client_time_ns = now_ns();
       r.x = x; r.y = y; r.width = w; r.height = h;
       pr = r.present;
       pthread_mutex_lock(&g_lock);
-      g_wsi.in_flight++;
-      if (mode == 3) g_wsi.latch_serial = r.present.serial;
+      if (s->handle != p->wsi) { pthread_mutex_unlock(&g_lock); return STATUS_SUCCESS; } /* destroyed meanwhile */
+      s->in_flight++;
+      if (mode == 3) s->latch_serial = r.present.serial;
       pthread_mutex_unlock(&g_lock);
       if (!p_send(WSD_PRESENT_REGION, &r, sizeof(r), -1)) {
          pthread_mutex_lock(&g_lock);
-         g_wsi.latch_serial = 0;
+         s->latch_serial = 0;
          pthread_mutex_unlock(&g_lock);
          return STATUS_SUCCESS;
       }
    }
-   if (mode == 3) latch_wait();
-   else if (mode == 2) pace_wait();
+   if (mode == 3) latch_wait(s);
+   else if (mode == 2) pace_wait(s);
 
-   if (!g_wsi.presents++) g_wsi.first_present_ns = pr.client_time_ns;
-   if (g_wsi.stat_last_ns) g_wsi.stat_interval_ns += pr.client_time_ns - g_wsi.stat_last_ns;
-   g_wsi.stat_last_ns = pr.client_time_ns;
-   if (g_wsi.presents <= 3 || g_wsi.presents % 60 == 0) {
-      uint64_t n = g_wsi.presents <= 3 ? 1 : (g_wsi.presents == 60 ? 57 : 60);
+   if (!s->presents++) s->first_present_ns = pr.client_time_ns;
+   if (s->stat_last_ns) s->stat_interval_ns += pr.client_time_ns - s->stat_last_ns;
+   s->stat_last_ns = pr.client_time_ns;
+   if (s->presents <= 3 || s->presents % 60 == 0) {
+      uint64_t n = s->presents <= 3 ? 1 : (s->presents == 60 ? 57 : 60);
       fprintf(stderr, "neptune unixlib wsi (wsd): %llu presents (%llu shown events), last %llu: interval avg %.3f ms, "
-              "fence wait avg %.3f ms, pacing wait avg %.3f ms, pacing timeouts %llu, presents without fence %llu, fence timeouts %llu\n",
-              (unsigned long long)g_wsi.presents, (unsigned long long)g_wsi.stat_presented, (unsigned long long)n,
-              g_wsi.stat_interval_ns / (double)n / 1e6, g_wsi.stat_fence_ns / (double)n / 1e6,
-              g_wsi.stat_pace_ns / (double)n / 1e6, (unsigned long long)g_wsi.stat_pace_timeouts,
-              (unsigned long long)g_wsi.stat_no_fence, (unsigned long long)g_wsi.stat_fence_timeouts);
-      g_wsi.stat_interval_ns = g_wsi.stat_fence_ns = g_wsi.stat_pace_ns = 0;
-      g_wsi.stat_pace_timeouts = g_wsi.stat_no_fence = 0;
+              "fence wait avg %.3f ms, pacing wait avg %.3f ms, pacing timeouts %llu, presents without fence %llu, fence timeouts %llu"
+              ", window %u\n",
+              (unsigned long long)s->presents, (unsigned long long)s->stat_presented, (unsigned long long)n,
+              s->stat_interval_ns / (double)n / 1e6, s->stat_fence_ns / (double)n / 1e6,
+              s->stat_pace_ns / (double)n / 1e6, (unsigned long long)s->stat_pace_timeouts,
+              (unsigned long long)s->stat_no_fence, (unsigned long long)s->stat_fence_timeouts, s->window_id);
+      s->stat_interval_ns = s->stat_fence_ns = s->stat_pace_ns = 0;
+      s->stat_pace_timeouts = s->stat_no_fence = 0;
    }
    p->result = 0;
    return STATUS_SUCCESS;
@@ -351,14 +412,17 @@ NTSTATUS npt_do_wsi_present(void *args)
 
 NTSTATUS npt_do_wsi_drain(void *args)
 {
-   static uint64_t drains, last_log_ns;
    struct npt_unix_wsi_drain_params *p = args;
+   struct wsi_state *s;
    struct timespec deadline;
    bool any = false;
 
    for (uint32_t i = 0; i < NPT_WSI_MAX_IMAGES; i++) p->released_count[i] = 0;
    p->result = -1;
-   if (!g_wsi.active) return STATUS_SUCCESS;
+   pthread_mutex_lock(&g_lock);
+   s = state_of(p->wsi);
+   pthread_mutex_unlock(&g_lock);
+   if (!s || !s->active) return STATUS_SUCCESS;
 
    clock_gettime(CLOCK_REALTIME, &deadline);
    deadline.tv_sec += p->timeout_ms / 1000;
@@ -367,21 +431,23 @@ NTSTATUS npt_do_wsi_drain(void *args)
 
    pthread_mutex_lock(&g_lock);
    for (;;) {
-      for (uint32_t i = 0; i < g_wsi.num_images; i++) if (g_wsi.released[i]) any = true;
+      /* the state is reused once destroyed: stop reading it when it no longer belongs to this caller */
+      if (s->handle != p->wsi) { pthread_mutex_unlock(&g_lock); return STATUS_SUCCESS; }
+      for (uint32_t i = 0; i < s->num_images; i++) if (s->released[i]) any = true;
       if (any || !p->timeout_ms) break;
       if (pthread_cond_timedwait(&g_cond, &g_lock, &deadline) == ETIMEDOUT) break;
    }
-   for (uint32_t i = 0; i < g_wsi.num_images; i++) {
-      p->released_count[i] = g_wsi.released[i];
-      g_wsi.released[i] = 0;
+   for (uint32_t i = 0; i < s->num_images; i++) {
+      p->released_count[i] = s->released[i];
+      s->released[i] = 0;
    }
-   drains++;
-   if (now_ns() - last_log_ns > 10000000000ull) {
+   s->drains++;
+   if (now_ns() - s->last_log_ns > 10000000000ull) {
       /* once every 10 s: shows whether the swapchain still presents at all */
-      last_log_ns = now_ns();
-      fprintf(stderr, "neptune unixlib wsi (wsd): alive: %llu presents, %llu shown events, %llu drains, in flight %u\n",
-              (unsigned long long)g_wsi.presents, (unsigned long long)g_wsi.stat_presented,
-              (unsigned long long)drains, g_wsi.in_flight);
+      s->last_log_ns = now_ns();
+      fprintf(stderr, "neptune unixlib wsi (wsd): alive: %llu presents, %llu shown events, %llu drains, in flight %u, window %u\n",
+              (unsigned long long)s->presents, (unsigned long long)s->stat_presented,
+              (unsigned long long)s->drains, s->in_flight, s->window_id);
    }
    pthread_mutex_unlock(&g_lock);
    p->result = 0;
@@ -390,11 +456,18 @@ NTSTATUS npt_do_wsi_drain(void *args)
 
 NTSTATUS npt_do_wsi_destroy(void *args)
 {
-   (void)args;
-   if (!g_wsi.active) return STATUS_SUCCESS;
-   detach_all();
+   const struct npt_unix_wsi_destroy_params *p = args;
+   struct wsi_state *s, old;
+   bool shared;
    pthread_mutex_lock(&g_lock);
-   memset(&g_wsi, 0, sizeof(g_wsi));
+   s = p ? state_of(p->wsi) : NULL;
+   if (!s) { pthread_mutex_unlock(&g_lock); return STATUS_SUCCESS; }
+   /* gone from the table before the detach: of two swapchains of one window destroyed at once, the last empties it */
+   old = *s;
+   memset(s, 0, sizeof(*s));
+   shared = window_shared(&old);
+   pthread_cond_broadcast(&g_cond);
    pthread_mutex_unlock(&g_lock);
+   detach_all(&old, shared);
    return STATUS_SUCCESS;
 }

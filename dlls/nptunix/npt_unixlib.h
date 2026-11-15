@@ -70,6 +70,7 @@ struct npt_unix_wsi_init_params {
    uint32_t width;
    uint32_t height;
    int result;
+   uint64_t wsi;        /* out: handle for the calls below */
 };
 
 /*
@@ -81,6 +82,7 @@ struct npt_unix_wsi_init_params {
  * Per-image release tracking goes through npt_unix_wsi_drain instead.
  */
 struct npt_unix_wsi_present_params {
+   uint64_t wsi;
    uint32_t image_index;
    int result;
    int wait_fence_fd;
@@ -95,10 +97,15 @@ struct npt_unix_wsi_present_params {
  * timeout_ms caps the wait so the forwarder can recheck its exit flag.
  */
 struct npt_unix_wsi_drain_params {
+   uint64_t wsi;
    uint32_t timeout_ms;
    uint32_t released_count[NPT_WSI_MAX_IMAGES];
    int result;
    uint32_t pad;
+};
+
+struct npt_unix_wsi_destroy_params {
+   uint64_t wsi;
 };
 
 struct npt_unix_virtgpu_open_params {
