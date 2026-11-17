@@ -274,4 +274,10 @@ WSD_ASSERT_SIZE(wsd_ev_motion, 24);
 WSD_ASSERT_SIZE(wsd_ev_presented, 56);
 WSD_ASSERT_SIZE(wsd_ev_release, 16);
 
+/* SET_FRAME_RATE value: a frame lock at the refresh of the window's screen divided by the low bits (2: every frame shown
+ * for two refreshes, 72 Hz on a 144 Hz screen, 60 on a 120 Hz one), followed when the window changes screens */
+#define WSD_FRAME_RATE_DIVISOR 0x80000000u
+/* or the highest rate in frames a second: wsd picks the steady rate for the screen, and follows the game */
+#define WSD_FRAME_RATE_AUTO 0x40000000u
+
 #endif
