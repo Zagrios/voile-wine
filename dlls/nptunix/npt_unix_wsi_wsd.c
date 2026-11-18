@@ -207,8 +207,8 @@ static struct wsi_state release_state(struct wsi_state *s, bool *in_use)
 NTSTATUS npt_do_wsi_init(void *args)
 {
    struct npt_unix_wsi_init_params *p = args;
-   struct wsi_state *s = NULL, reclaimed;
-   bool reclaim = false, in_use = false;
+   struct wsi_state *s = NULL, reclaimed = { 0 };   /* a reclaimed state has a handle */
+   bool in_use = false;
    uint32_t ids[NPT_WSI_MAX_IMAGES] = { 0 };
    uint64_t handle;
    p->result = -1;
@@ -238,12 +238,11 @@ NTSTATUS npt_do_wsi_init(void *args)
       fprintf(stderr, "neptune unixlib wsi (wsd): no free swapchain state, reclaiming swapchain %llu of window %u\n",
               (unsigned long long)s->handle, s->window_id);
       reclaimed = release_state(s, &in_use);
-      reclaim = true;
    }
    handle = s->handle = ++g_next_handle;
    s->used = ++g_uses;
    pthread_mutex_unlock(&g_lock);
-   if (reclaim) detach_state(&reclaimed, !in_use);
+   if (reclaimed.handle) detach_state(&reclaimed, !in_use);
    p_set_release_listener(on_release);
    p_set_presented_listener(on_presented);
 
@@ -314,46 +313,38 @@ static void deadline_in_ms(struct timespec *deadline, long ms)
    if (deadline->tv_nsec >= 1000000000) { deadline->tv_sec++; deadline->tv_nsec -= 1000000000; }
 }
 
-/* "latch": until wsd releases the frame sent last. Like pace_wait, for the swapchain of handle only: once the state
- * is destroyed or reclaimed it is another swapchain's, and is left alone. */
-static void latch_wait(struct wsi_state *s, uint64_t handle)
+/* whether s is still the state of the swapchain of handle, not destroyed or reclaimed meanwhile; stamps its use */
+static bool touch_state(struct wsi_state *s, uint64_t handle)
+{
+   bool ours;
+   pthread_mutex_lock(&g_lock);
+   if ((ours = s->handle == handle)) s->used = ++g_uses;
+   pthread_mutex_unlock(&g_lock);
+   return ours;
+}
+
+/* Waits at most 100 ms: with latch until wsd releases the frame sent last, else until wsd has shown every frame
+ * sent. For the swapchain of handle only: once the state is destroyed or reclaimed it is another swapchain's, is left
+ * alone, and false is returned. */
+static bool pace_wait(struct wsi_state *s, uint64_t handle, bool latch)
 {
    struct timespec deadline;
    int timedout = 0;
    uint64_t w0;
+   bool ours;
    deadline_in_ms(&deadline, 100);
    pthread_mutex_lock(&g_lock);
    w0 = now_ns();
-   while (s->handle == handle && s->latch_serial && !timedout)
+   while (s->handle == handle && (latch ? s->latch_serial : s->in_flight) && !timedout)
       timedout = pthread_cond_timedwait(&g_cond, &g_lock, &deadline) == ETIMEDOUT;
-   if (s->handle == handle) {
+   if ((ours = s->handle == handle)) {
       if (timedout) s->stat_pace_timeouts++;
       s->stat_pace_ns += now_ns() - w0;
-      s->latch_serial = 0;
+      if (latch) s->latch_serial = 0;
+      else s->in_flight = 0;
    }
    pthread_mutex_unlock(&g_lock);
-}
-
-static void pace_wait(struct wsi_state *s, uint64_t handle)
-{
-   {
-      struct timespec deadline;
-      clock_gettime(CLOCK_REALTIME, &deadline);
-      deadline.tv_nsec += 100 * 1000000;
-      if (deadline.tv_nsec >= 1000000000) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000; }
-      pthread_mutex_lock(&g_lock);
-      uint64_t w0 = now_ns();
-      int timedout = 0;
-      while (s->handle == handle && s->in_flight && !timedout)
-         timedout = pthread_cond_timedwait(&g_cond, &g_lock, &deadline) == ETIMEDOUT;
-      if (s->handle == handle) {
-         if (timedout) s->stat_pace_timeouts++;
-         s->stat_pace_ns += now_ns() - w0;
-         s->in_flight = 0;
-      }
-      pthread_mutex_unlock(&g_lock);
-   }
-
+   return ours;
 }
 
 NTSTATUS npt_do_wsi_present(void *args)
@@ -363,7 +354,7 @@ NTSTATUS npt_do_wsi_present(void *args)
    struct wsi_state *s;
    uint64_t t0 = now_ns();
    int mode;
-   bool gone, fence_timeout = false;
+   bool fence_timeout = false;
 
    p->result = -1;
    p->wait_fence_consumed = 0;
@@ -389,11 +380,7 @@ NTSTATUS npt_do_wsi_present(void *args)
       close(p->wait_fence_fd);
       p->wait_fence_consumed = 1;
    }
-   pthread_mutex_lock(&g_lock);
-   gone = s->handle != p->wsi;   /* destroyed or reclaimed during the fence wait: the state is another swapchain's */
-   if (!gone) s->used = ++g_uses;
-   pthread_mutex_unlock(&g_lock);
-   if (gone) return STATUS_SUCCESS;
+   if (!touch_state(s, p->wsi)) return STATUS_SUCCESS;   /* destroyed or reclaimed during the fence wait */
    if (fence_timeout) {
       s->stat_fence_timeouts++;
       fprintf(stderr, "neptune unixlib wsi (wsd): fence of present %llu not signaled after 1 s (image %u)\n",
@@ -408,7 +395,7 @@ NTSTATUS npt_do_wsi_present(void *args)
    }
 
    mode = pacing_mode(p);
-   if (mode == 1) pace_wait(s, p->wsi);
+   if (mode == 1) pace_wait(s, p->wsi, false);
 
    /* the swapchain covers the client area of the window (Wine draws the frame): present into an overlay plane */
    {
@@ -434,12 +421,8 @@ NTSTATUS npt_do_wsi_present(void *args)
          return STATUS_SUCCESS;
       }
    }
-   if (mode == 3) latch_wait(s, p->wsi);
-   else if (mode == 2) pace_wait(s, p->wsi);
-   pthread_mutex_lock(&g_lock);
-   gone = s->handle != p->wsi;   /* as above, during the pacing wait */
-   pthread_mutex_unlock(&g_lock);
-   if (gone) return STATUS_SUCCESS;
+   /* as above, during the pacing wait or the send */
+   if (!(mode >= 2 ? pace_wait(s, p->wsi, mode == 3) : touch_state(s, p->wsi))) return STATUS_SUCCESS;
 
    s->presents++;
    if (s->stat_last_ns) s->stat_interval_ns += pr.client_time_ns - s->stat_last_ns;
@@ -465,7 +448,7 @@ NTSTATUS npt_do_wsi_drain(void *args)
    struct npt_unix_wsi_drain_params *p = args;
    struct wsi_state *s;
    struct timespec deadline;
-   bool any = false;
+   bool any = false, timedout = false;
 
    for (uint32_t i = 0; i < NPT_WSI_MAX_IMAGES; i++) p->released_count[i] = 0;
    p->result = -1;
@@ -479,11 +462,8 @@ NTSTATUS npt_do_wsi_drain(void *args)
       /* looked up again after every wait: a state destroyed meanwhile (and maybe reused) ends the drain */
       if (!(s = state_of(p->wsi))) { pthread_mutex_unlock(&g_lock); return STATUS_SUCCESS; }
       for (uint32_t i = 0; i < s->num_images; i++) if (s->released[i]) any = true;
-      if (any || !p->timeout_ms) break;
-      if (pthread_cond_timedwait(&g_cond, &g_lock, &deadline) == ETIMEDOUT) {
-         if (!(s = state_of(p->wsi))) { pthread_mutex_unlock(&g_lock); return STATUS_SUCCESS; }
-         break;
-      }
+      if (any || !p->timeout_ms || timedout) break;
+      timedout = pthread_cond_timedwait(&g_cond, &g_lock, &deadline) == ETIMEDOUT;
    }
    s->used = ++g_uses;
    for (uint32_t i = 0; i < s->num_images; i++) {
