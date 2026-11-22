@@ -1410,8 +1410,11 @@ static GLenum drawable_buffer_from_buffer( struct opengl_drawable *drawable, GLe
     return drawable->buffer_map[buffer - GL_FRONT_LEFT];
 }
 
-static BOOL context_draws_back( struct context *ctx )
+static BOOL context_draws_back( struct context *ctx, struct opengl_drawable *drawable )
 {
+    /* none set by the application: GL's default, the back buffer if there is one */
+    if (!ctx->color_buffer.draw_buffers[0]) return drawable->doublebuffer;
+
     for (int i = 0; i < ARRAY_SIZE(ctx->color_buffer.draw_buffers); i++)
     {
         switch (ctx->color_buffer.draw_buffers[i])
@@ -1429,8 +1432,11 @@ static BOOL context_draws_back( struct context *ctx )
     return FALSE;
 }
 
-static BOOL context_draws_front( struct context *ctx )
+static BOOL context_draws_front( struct context *ctx, struct opengl_drawable *drawable )
 {
+    /* none set by the application: GL's default, the front buffer if there is no back one */
+    if (!ctx->color_buffer.draw_buffers[0]) return !drawable->doublebuffer;
+
     for (int i = 0; i < ARRAY_SIZE(ctx->color_buffer.draw_buffers); i++)
     {
         switch (ctx->color_buffer.draw_buffers[i])
@@ -1455,7 +1461,7 @@ static void flush_context( TEB *teb, void (*flush)(void) )
     const struct opengl_funcs *funcs = teb->glTable;
     UINT flags = 0;
 
-    if (flush && ctx && !ctx->draw_fbo && context_draws_front( ctx ) && draw->client) flags |= GL_FLUSH_PRESENT;
+    if (flush && ctx && !ctx->draw_fbo && context_draws_front( ctx, draw ) && draw->client) flags |= GL_FLUSH_PRESENT;
     if ((flags & GL_FLUSH_PRESENT) && draw->buffer_map[0] == GL_BACK_LEFT) flags |= GL_FLUSH_FORCE_SWAP;
 
     if (!ctx || !funcs->p_wgl_context_flush( &ctx->base, flush, flags ))
@@ -1853,7 +1859,7 @@ void resolve_default_fbo( TEB *teb, BOOL read )
 
         NtUserGetClientRect( drawable->client->hwnd, &rect, NtUserGetDpiForWindow( drawable->client->hwnd ) );
 
-        if (context_draws_front( ctx ))
+        if (context_draws_front( ctx, drawable ))
         {
             funcs->p_glNamedFramebufferReadBuffer( drawable->draw_fbo, GL_COLOR_ATTACHMENT0 );
             funcs->p_glNamedFramebufferDrawBuffer( drawable->read_fbo, GL_COLOR_ATTACHMENT0 );
@@ -1862,7 +1868,7 @@ void resolve_default_fbo( TEB *teb, BOOL read )
             mask &= ~(GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
         }
 
-        if ((drawable->doublebuffer && context_draws_back( ctx )) || (!drawable->doublebuffer && drawable->stereo && context_draws_front( ctx )))
+        if ((drawable->doublebuffer && context_draws_back( ctx, drawable )) || (!drawable->doublebuffer && drawable->stereo && context_draws_front( ctx, drawable )))
         {
             funcs->p_glNamedFramebufferReadBuffer( drawable->draw_fbo, GL_COLOR_ATTACHMENT1 );
             funcs->p_glNamedFramebufferDrawBuffer( drawable->read_fbo, GL_COLOR_ATTACHMENT1 );
@@ -1871,7 +1877,7 @@ void resolve_default_fbo( TEB *teb, BOOL read )
             mask &= ~(GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
         }
 
-        if (drawable->doublebuffer && drawable->stereo && context_draws_front( ctx ))
+        if (drawable->doublebuffer && drawable->stereo && context_draws_front( ctx, drawable ))
         {
             funcs->p_glNamedFramebufferReadBuffer( drawable->draw_fbo, GL_COLOR_ATTACHMENT2 );
             funcs->p_glNamedFramebufferDrawBuffer( drawable->read_fbo, GL_COLOR_ATTACHMENT2 );
@@ -1880,7 +1886,7 @@ void resolve_default_fbo( TEB *teb, BOOL read )
             mask &= ~(GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
         }
 
-        if (drawable->doublebuffer && drawable->stereo && context_draws_back( ctx ))
+        if (drawable->doublebuffer && drawable->stereo && context_draws_back( ctx, drawable ))
         {
             funcs->p_glNamedFramebufferReadBuffer( drawable->draw_fbo, GL_COLOR_ATTACHMENT3 );
             funcs->p_glNamedFramebufferDrawBuffer( drawable->read_fbo, GL_COLOR_ATTACHMENT3 );

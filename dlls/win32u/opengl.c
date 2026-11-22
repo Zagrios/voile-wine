@@ -177,6 +177,8 @@ static BOOL opengl_drawable_swap( struct opengl_drawable *drawable )
 struct framebuffer_surface
 {
     struct opengl_drawable base;
+    void                  *bits;            /* pixels of the last swapped frame, for the window */
+    SIZE_T                 bits_size;
 };
 
 static GLenum color_format_from_pfd( const struct wgl_pixel_format *desc )
@@ -266,7 +268,8 @@ static GLuint create_framebuffer( struct opengl_drawable *drawable, const struct
         TRACE( "drawable %p/%u created depth buffer %u\n", drawable, fbo, name );
     }
 
-    funcs->p_glNamedFramebufferDrawBuffer( fbo, GL_COLOR_ATTACHMENT0 );
+    /* GL's defaults for a window: draw into and read from the back buffer if there is one, else the front one */
+    funcs->p_glNamedFramebufferDrawBuffer( fbo, drawable->doublebuffer ? GL_COLOR_ATTACHMENT1 : GL_COLOR_ATTACHMENT0 );
     funcs->p_glNamedFramebufferReadBuffer( fbo, drawable->doublebuffer ? GL_COLOR_ATTACHMENT1 : GL_COLOR_ATTACHMENT0 );
     TRACE( "drawable %p created framebuffer %u\n", drawable, fbo );
 
@@ -330,7 +333,9 @@ static void destroy_framebuffer( struct opengl_drawable *drawable, const struct 
 
 static void framebuffer_surface_destroy( struct opengl_drawable *drawable )
 {
+    struct framebuffer_surface *surface = CONTAINING_RECORD( drawable, struct framebuffer_surface, base );
     TRACE( "%s\n", debugstr_opengl_drawable( drawable ) );
+    free( surface->bits );
 }
 
 static void framebuffer_surface_resize( struct opengl_drawable *drawable )
@@ -390,9 +395,77 @@ static void framebuffer_surface_flush( struct opengl_drawable *drawable, UINT fl
     if (flags & GL_FLUSH_UPDATED && drawable->read_fbo) framebuffer_surface_resize( drawable );
 }
 
+/* A window drawable of a driver that gives windows no GL surface of their own (the surfaceless EGL path) is this
+ * framebuffer object, which nothing shows. On swap, copy its back buffer into the window through GDI, as the
+ * window surface's pixels, and flush the window surfaces so that the driver presents the frame now. */
 static BOOL framebuffer_surface_swap( struct opengl_drawable *drawable )
 {
+    struct framebuffer_surface *surface = CONTAINING_RECORD( drawable, struct framebuffer_surface, base );
+    const struct opengl_funcs *funcs = &display_funcs;
+    char buffer[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
+    BITMAPINFO *info = (BITMAPINFO *)buffer;
+    GLint read_binding = 0, read_buffer = GL_NONE, pack_buffer = 0;
+    GLint pack_alignment = 4, pack_row_length = 0, pack_skip_rows = 0, pack_skip_pixels = 0;
+    HWND hwnd = drawable->client->hwnd;
+    int width, height;
+    RECT rect;
+    void *bits;
+    HDC hdc;
+
     TRACE( "%s\n", debugstr_opengl_drawable( drawable ) );
+
+    /* opengl32 has already resolved a multisampled draw framebuffer into this one */
+    if (!drawable->read_fbo) return TRUE;
+    NtUserGetClientRect( hwnd, &rect, NtUserGetDpiForWindow( hwnd ) );
+    if ((width = rect.right) <= 0 || (height = rect.bottom) <= 0) return TRUE;
+    if (surface->bits_size < (SIZE_T)width * height * 4)
+    {
+        free( surface->bits );
+        surface->bits_size = 0;
+        if (!(surface->bits = malloc( (SIZE_T)width * height * 4 ))) return FALSE;
+        surface->bits_size = (SIZE_T)width * height * 4;
+    }
+    bits = surface->bits;
+
+    funcs->p_glGetIntegerv( GL_READ_FRAMEBUFFER_BINDING, &read_binding );
+    funcs->p_glBindFramebuffer( GL_READ_FRAMEBUFFER, drawable->read_fbo );
+    funcs->p_glGetIntegerv( GL_READ_BUFFER, &read_buffer );
+    funcs->p_glGetIntegerv( GL_PIXEL_PACK_BUFFER_BINDING, &pack_buffer );
+    funcs->p_glGetIntegerv( GL_PACK_ALIGNMENT, &pack_alignment );
+    funcs->p_glGetIntegerv( GL_PACK_ROW_LENGTH, &pack_row_length );
+    funcs->p_glGetIntegerv( GL_PACK_SKIP_ROWS, &pack_skip_rows );
+    funcs->p_glGetIntegerv( GL_PACK_SKIP_PIXELS, &pack_skip_pixels );
+    if (pack_buffer) funcs->p_glBindBuffer( GL_PIXEL_PACK_BUFFER, 0 );
+    funcs->p_glPixelStorei( GL_PACK_ALIGNMENT, 4 );
+    funcs->p_glPixelStorei( GL_PACK_ROW_LENGTH, 0 );
+    funcs->p_glPixelStorei( GL_PACK_SKIP_ROWS, 0 );
+    funcs->p_glPixelStorei( GL_PACK_SKIP_PIXELS, 0 );
+    /* the back buffer, which the frame was drawn into (the front one if the format has none) */
+    funcs->p_glReadBuffer( drawable->doublebuffer ? GL_COLOR_ATTACHMENT1 : GL_COLOR_ATTACHMENT0 );
+    funcs->p_glReadPixels( 0, 0, width, height, GL_BGRA, GL_UNSIGNED_BYTE, bits );
+    funcs->p_glReadBuffer( read_buffer );
+    funcs->p_glPixelStorei( GL_PACK_ALIGNMENT, pack_alignment );
+    funcs->p_glPixelStorei( GL_PACK_ROW_LENGTH, pack_row_length );
+    funcs->p_glPixelStorei( GL_PACK_SKIP_ROWS, pack_skip_rows );
+    funcs->p_glPixelStorei( GL_PACK_SKIP_PIXELS, pack_skip_pixels );
+    if (pack_buffer) funcs->p_glBindBuffer( GL_PIXEL_PACK_BUFFER, pack_buffer );
+    funcs->p_glBindFramebuffer( GL_READ_FRAMEBUFFER, read_binding );
+
+    memset( info, 0, sizeof(info->bmiHeader) );
+    info->bmiHeader.biSize = sizeof(info->bmiHeader);
+    info->bmiHeader.biWidth = width;
+    info->bmiHeader.biHeight = height; /* bottom-up, as GL returns the rows */
+    info->bmiHeader.biPlanes = 1;
+    info->bmiHeader.biBitCount = 32;
+    info->bmiHeader.biCompression = BI_RGB;
+    /* a cache DC: the window's own DC (CS_OWNDC) may carry a mapping mode or an origin the application set */
+    if ((hdc = NtUserGetDCEx( hwnd, 0, DCX_CACHE | DCX_USESTYLE )))
+    {
+        NtGdiSetDIBitsToDeviceInternal( hdc, 0, 0, width, height, 0, 0, 0, height, bits, info, DIB_RGB_COLORS,
+                                        0, 0, FALSE, NULL );
+        NtUserReleaseDC( hwnd, hdc );
+    }
+    flush_window_surfaces( TRUE );
     return TRUE;
 }
 
@@ -460,7 +533,7 @@ static UINT egldrv_init_pixel_formats( UINT *onscreen_count )
 {
     const struct opengl_funcs *funcs = &display_funcs;
     struct egl_platform *egl = &display_egl;
-    EGLConfig *configs;
+    EGLConfig *configs, *deep;
     EGLint i, j, render, count;
 
     funcs->p_eglGetConfigs( egl->display, NULL, 0, &count );
@@ -478,6 +551,23 @@ static UINT egldrv_init_pixel_formats( UINT *onscreen_count )
         if (render & EGL_OPENGL_BIT) configs[j++] = configs[i];
     }
     count = j;
+
+    /* Put the configs of at most 8 bits per channel first, keeping their order. Windows drivers list those
+     * formats first, and ChoosePixelFormat keeps the first of the formats that match a request equally well:
+     * Mesa lists RGB10_A2 first, which would answer a request for 32 color bits with 2 alpha bits (and make
+     * every presented frame need a conversion). */
+    if ((deep = malloc( count * sizeof(*deep) )))
+    {
+        EGLint red, n = 0;
+        for (i = 0, j = 0; i < count; i++)
+        {
+            funcs->p_eglGetConfigAttrib( egl->display, configs[i], EGL_RED_SIZE, &red );
+            if (red > 8) deep[n++] = configs[i];
+            else configs[j++] = configs[i];
+        }
+        memcpy( configs + j, deep, n * sizeof(*deep) );
+        free( deep );
+    }
 
     if (TRACE_ON(wgl)) for (i = 0; i < count; i++)
     {
@@ -2498,6 +2588,7 @@ static void display_funcs_init(void)
     if (!display_funcs.p_##func && !(display_funcs.p_##func = driver_funcs->p_get_proc_address( #func ))) \
         WARN( "%s not found.\n", #func );
     ALL_GL_FUNCS
+    USE_GL_FUNC(glBindBuffer)
     USE_GL_FUNC(glBindFramebuffer)
     USE_GL_FUNC(glCheckNamedFramebufferStatus)
     USE_GL_FUNC(glCreateFramebuffers)
