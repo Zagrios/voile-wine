@@ -4399,6 +4399,46 @@ static NTSTATUS fill_battery_state( SYSTEM_BATTERY_STATE *bs )
     return STATUS_SUCCESS;
 }
 
+/* The fastest CPU state on Apple silicon, 0 elsewhere. Under Rosetta hw.cpufrequency is a fixed
+ * 2400 MHz whatever the chip. Each voltage-statesN-sram table holds a frequency and a voltage per
+ * state, both 32-bit, the fastest last; CPU tables are in Hz up to M3 and in kHz from M4 on, the
+ * GPU's in Hz and slower. Same rule as fexdarwin's, so both engines agree. */
+static unsigned int get_apple_cpu_max_mhz(void)
+{
+    static unsigned int max_mhz = ~0u;
+    io_registry_entry_t pmgr;
+    unsigned int n, best = 0;
+
+    if (max_mhz != ~0u) return max_mhz;
+
+    if ((pmgr = IORegistryEntryFromPath( 0, "IODeviceTree:/arm-io/pmgr" )))
+    {
+        for (n = 0; n < 64; n++)
+        {
+            char name[32];
+            CFStringRef key;
+            CFTypeRef states;
+
+            snprintf( name, sizeof(name), "voltage-states%u-sram", n );
+            if (!(key = CFStringCreateWithCString( NULL, name, kCFStringEncodingASCII ))) continue;
+            states = IORegistryEntryCreateCFProperty( pmgr, key, kCFAllocatorDefault, 0 );
+            CFRelease( key );
+            if (!states) continue;
+            if (CFGetTypeID( states ) == CFDataGetTypeID() && CFDataGetLength( states ) >= 8)
+            {
+                const UInt8 *p = CFDataGetBytePtr( states ) + (CFDataGetLength( states ) & ~7) - 8;
+                UInt32 top = p[0] | (p[1] << 8) | (p[2] << 16) | ((UInt32)p[3] << 24);
+                UInt32 khz = top >= 100000000 ? top / 1000 : top;
+                if (khz >= 100000 && khz <= 10000000 && khz > best) best = khz;
+            }
+            CFRelease( states );
+        }
+        IOObjectRelease( pmgr );
+    }
+    TRACE( "fastest CPU state %u kHz\n", best );
+    return max_mhz = best / 1000;
+}
+
 #elif defined(__FreeBSD__)
 
 #include <dev/acpica/acpiio.h>
@@ -4592,6 +4632,7 @@ NTSTATUS WINAPI NtPowerInformation( POWER_INFORMATION_LEVEL level, void *input, 
             size_t valSize;
             unsigned long long currentMhz;
             unsigned long long maxMhz;
+            unsigned int pcoreMhz;
 
             valSize = sizeof(currentMhz);
             if (!sysctlbyname("hw.cpufrequency", &currentMhz, &valSize, NULL, 0))
@@ -4604,6 +4645,9 @@ NTSTATUS WINAPI NtPowerInformation( POWER_INFORMATION_LEVEL level, void *input, 
                 maxMhz /= 1000000;
             else
                 maxMhz = currentMhz;
+
+            if ((pcoreMhz = get_apple_cpu_max_mhz()))
+                currentMhz = maxMhz = pcoreMhz;
 
             for(i = 0; i < out_cpus; i++) {
                 cpu_power[i].CurrentMhz = currentMhz;
