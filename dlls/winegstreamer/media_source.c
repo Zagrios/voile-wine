@@ -526,6 +526,8 @@ static BOOL enqueue_token(struct media_stream *stream, IUnknown *token)
             return FALSE;
         }
     }
+    if (token)
+        IUnknown_AddRef(token);
     stream->token_queue[stream->token_queue_count++] = token;
     return TRUE;
 }
@@ -551,6 +553,8 @@ static void flush_token_queue(struct media_stream *stream, BOOL send)
                 hr = MFPutWorkItem(source->async_commands_queue, &source->async_commands_callback, op);
                 IUnknown_Release(op);
             }
+            else if (stream->token_queue[i])
+                IUnknown_Release(stream->token_queue[i]);
             if (FAILED(hr))
                 WARN("Could not enqueue sample request, hr %#lx\n", hr);
         }
