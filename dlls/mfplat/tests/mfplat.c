@@ -1258,6 +1258,8 @@ static void test_source_resolver(void)
     IMFByteStream *stream, *tmp_stream;
     IMFGetService *get_service;
     IMFRateSupport *rate_support;
+    IUnknown *token, *sample_token;
+    IMFSample *token_sample;
     WCHAR pathW[MAX_PATH];
     int i, sample_count;
     DWORD size, flags;
@@ -1593,6 +1595,40 @@ static void test_source_resolver(void)
     if (get_event((IMFMediaEventGenerator *)mediasource, MESourcePaused, &var))
         ok(var.vt == VT_EMPTY, "Unexpected value type.\n");
 
+    /* A sample requested while paused comes with its token once the source runs again. */
+    hr = MFCreateAttributes(&attributes, 0);
+    ok(hr == S_OK, "Failed to create attributes, hr %#lx.\n", hr);
+    token = (IUnknown *)attributes;
+    /* One more reference, so that a token released once too often stays alive. */
+    IUnknown_AddRef(token);
+    hr = IMFMediaStream_RequestSample(video_stream, token);
+    ok(hr == S_OK, "Failed to request sample, hr %#lx.\n", hr);
+
+    var.vt = VT_EMPTY;
+    hr = IMFMediaSource_Start(mediasource, descriptor, &GUID_NULL, &var);
+    ok(hr == S_OK, "Failed to start media source, hr %#lx.\n", hr);
+    if (get_event((IMFMediaEventGenerator *)mediasource, MESourceStarted, &var))
+        ok(var.vt == VT_EMPTY, "Unexpected value type.\n");
+
+    if (get_event((IMFMediaEventGenerator *)video_stream, MEMediaSample, &var))
+    {
+        ok(var.vt == VT_UNKNOWN, "Unexpected value type %u from MEMediaSample event.\n", var.vt);
+        token_sample = (IMFSample *)var.punkVal;
+        hr = IMFSample_GetUnknown(token_sample, &MFSampleExtension_Token, &IID_IUnknown, (void **)&sample_token);
+        ok(hr == S_OK, "Failed to get sample token, hr %#lx.\n", hr);
+        if (hr == S_OK)
+        {
+            ok(sample_token == token, "Unexpected token %p, expected %p.\n", sample_token, token);
+            IUnknown_Release(sample_token);
+        }
+        IMFSample_Release(token_sample);
+    }
+
+    hr = IMFMediaSource_Pause(mediasource);
+    ok(hr == S_OK, "Failed to pause media source, hr %#lx.\n", hr);
+    if (get_event((IMFMediaEventGenerator *)mediasource, MESourcePaused, &var))
+        ok(var.vt == VT_EMPTY, "Unexpected value type.\n");
+
     var.vt = VT_I8;
     var.uhVal.QuadPart = 0;
     hr = IMFMediaSource_Start(mediasource, descriptor, &GUID_NULL, &var);
@@ -1685,6 +1721,11 @@ static void test_source_resolver(void)
     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
 
     ok(bytestream_closed, "Missing IMFByteStream::Close call\n");
+
+    refcount = IUnknown_Release(token);
+    ok(refcount == 1, "Unexpected refcount %lu.\n", refcount);
+    if (refcount)
+        IUnknown_Release(token);
 
     hr = IMFMediaSource_CreatePresentationDescriptor(mediasource, NULL);
     ok(hr == MF_E_SHUTDOWN, "Unexpected hr %#lx.\n", hr);
