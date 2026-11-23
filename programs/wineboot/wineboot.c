@@ -218,6 +218,22 @@ static BOOL is_tsc_trusted_by_the_kernel(void)
     return ret;
 }
 
+/* Rosetta and FEX count the TSC at a fixed rate that has nothing to do with the CPU clock. */
+static BOOL is_tsc_cpu_clock(void)
+{
+    int regs[4], brand[13] = {0};
+
+    __cpuid( regs, 0x40000000 );
+    if (!memcmp( regs + 1, "FEXIFEXIEMU", 12 )) return FALSE;
+
+    __cpuid( regs, 0x80000000 );
+    if (regs[0] < 0x80000004) return TRUE;
+    __cpuid( brand, 0x80000002 );
+    __cpuid( brand + 4, 0x80000003 );
+    __cpuid( brand + 8, 0x80000004 );
+    return !strstr( (char *)brand, "VirtualApple" );
+}
+
 static UINT64 read_tsc_frequency(void)
 {
     UINT64 freq = 0;
@@ -230,6 +246,12 @@ static UINT64 read_tsc_frequency(void)
     if (!is_tsc_trusted_by_the_kernel())
     {
         WARN( "Failed to compute TSC frequency, not trusted by the kernel.\n" );
+        return 0;
+    }
+
+    if (!is_tsc_cpu_clock())
+    {
+        TRACE( "Not computing TSC frequency, the TSC does not count CPU cycles.\n" );
         return 0;
     }
 
