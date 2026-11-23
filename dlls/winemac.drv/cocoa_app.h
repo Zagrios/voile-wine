@@ -83,6 +83,10 @@ enum {
     BOOL        cursorIsCurrent;
     BOOL        cursorHidden;
     BOOL        clientWantsCursorHidden;
+    NSCursor*   invisibleCursor;
+    BOOL        cursorIsInvisible;
+    BOOL        cursorMayBeShown;
+    NSTimeInterval lastInvisibleCursorTime;
 
     NSTimeInterval lastSetCursorPositionTime;
 

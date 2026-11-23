@@ -221,6 +221,7 @@ static NSString* WineLocalizedString(unsigned int stringID)
     {
         [windowsBeingDragged release];
         [cursor release];
+        [invisibleCursor release];
         [screenFrameCGRects release];
         [applicationIcon release];
         [clipCursorHandler release];
@@ -852,6 +853,8 @@ static NSString* WineLocalizedString(unsigned int stringID)
     {
         [self updateFullscreenWindows];
         [self adjustWindowLevels];
+        if ([NSApp isActive])
+            [self rehideCursor:TRUE];
     }
 
     - (void) sendDisplaysChanged:(BOOL)activating
@@ -1054,10 +1057,17 @@ static NSString* WineLocalizedString(unsigned int stringID)
                 cursorHidden = TRUE;
             }
 
-            if (!cursorIsCurrent)
+            if (clientWantsCursorHidden && !cursorIsInvisible)
+            {
+                [[self invisibleCursor] set];
+                cursorIsInvisible = TRUE;
+                cursorIsCurrent = FALSE;
+            }
+            else if (!clientWantsCursorHidden && !cursorIsCurrent)
             {
                 [cursor set];
                 cursorIsCurrent = TRUE;
+                cursorIsInvisible = FALSE;
             }
 
             if (!clientWantsCursorHidden && cursorHidden)
@@ -1068,10 +1078,11 @@ static NSString* WineLocalizedString(unsigned int stringID)
         }
         else
         {
-            if (cursorIsCurrent)
+            if (cursorIsCurrent || cursorIsInvisible)
             {
                 [[NSCursor arrowCursor] set];
                 cursorIsCurrent = FALSE;
+                cursorIsInvisible = FALSE;
             }
             if (cursorHidden)
             {
@@ -1079,6 +1090,42 @@ static NSString* WineLocalizedString(unsigned int stringID)
                 cursorHidden = FALSE;
             }
         }
+    }
+
+    - (NSCursor*) invisibleCursor
+    {
+        if (!invisibleCursor)
+        {
+            NSImage* image = [[NSImage alloc] initWithSize:NSMakeSize(16, 16)];
+            invisibleCursor = [[NSCursor alloc] initWithImage:image hotSpot:NSZeroPoint];
+            [image release];
+        }
+        return invisibleCursor;
+    }
+
+    // macOS shows the cursor again (Dock, menu bar, activation, Space change)
+    // without telling us.  While hidden, keep the empty cursor set and redo
+    // the hide once back over our window; unhide+hide keeps the count at one.
+    - (void) rehideCursor:(BOOL)force
+    {
+        NSTimeInterval now = [[NSProcessInfo processInfo] systemUptime];
+
+        if (!cursorHidden || !clientWantsCursorHidden)
+            return;
+
+        if (force || cursorMayBeShown)
+        {
+            [NSCursor unhide];
+            [NSCursor hide];
+            cursorMayBeShown = FALSE;
+        }
+        else if (now - lastInvisibleCursorTime < 0.1)
+            return;
+
+        [[self invisibleCursor] set];
+        cursorIsInvisible = TRUE;
+        cursorIsCurrent = FALSE;
+        lastInvisibleCursorTime = now;
     }
 
     - (void) hideCursor
@@ -1466,6 +1513,7 @@ static NSString* WineLocalizedString(unsigned int stringID)
     {
         WineWindow* targetWindow;
         BOOL drag = [anEvent type] != NSEventTypeMouseMoved;
+        BOOL overOtherWindow = FALSE;
 
         if ([windowsBeingDragged count])
             targetWindow = nil;
@@ -1486,6 +1534,7 @@ static NSString* WineLocalizedString(unsigned int stringID)
             windowUnderNumber = [NSWindow windowNumberAtPoint:point
                                   belowWindowWithWindowNumber:0];
             targetWindow = (WineWindow*)[NSApp windowWithWindowNumber:windowUnderNumber];
+            overOtherWindow = ![targetWindow isKindOfClass:[WineWindow class]];
             if (!NSMouseInRect(point, [targetWindow contentRectForFrameRect:[targetWindow frame]], NO))
                 targetWindow = nil;
 
@@ -1613,6 +1662,11 @@ static NSString* WineLocalizedString(unsigned int stringID)
             lastTargetWindow = nil;
 
         [self updateCursor:FALSE];
+
+        if (overOtherWindow)
+            cursorMayBeShown = TRUE;
+        else
+            [self rehideCursor:FALSE];
     }
 
     - (void) handleMouseButton:(NSEvent*)theEvent
@@ -2508,6 +2562,8 @@ static NSString* WineLocalizedString(unsigned int stringID)
         // movement deltas are invalidated.  Make sure the next mouse move event
         // starts over from an absolute baseline.
         forceNextMouseMoveAbsolute = TRUE;
+
+        [self rehideCursor:TRUE];
     }
 
     - (void)applicationDidChangeScreenParameters:(NSNotification *)notification
