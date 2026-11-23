@@ -447,7 +447,7 @@ done:
  * the video formats: asked for such a texture, DXMT fails and D3DMetal stops the process, so
  * the device is asked what it supports and never for a texture. A Direct3D 9 manager, and a
  * manager that has no device yet, are taken as they always were. */
-static BOOL device_manager_holds_type(IUnknown *device_manager, IMFMediaType *type)
+BOOL device_manager_holds_type(IUnknown *device_manager, IMFMediaType *type)
 {
     IMFDXGIDeviceManager *manager;
     ID3D11Device *device;

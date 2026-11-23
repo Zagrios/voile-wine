@@ -176,6 +176,7 @@ static HRESULT try_create_wg_transform(struct video_processor *impl)
 
 static HRESULT video_processor_init_allocator(struct video_processor *processor)
 {
+    IUnknown *device_manager = processor->device_manager;
     IMFVideoSampleAllocatorEx *allocator;
     UINT32 count;
     HRESULT hr;
@@ -183,11 +184,18 @@ static HRESULT video_processor_init_allocator(struct video_processor *processor)
     if (processor->allocator)
         return S_OK;
 
+    /* The manager came before an output type its device cannot make: use system memory. */
+    if (device_manager && !device_manager_holds_type(device_manager, processor->output_type))
+    {
+        WARN("The device cannot make textures of the output type, processing to system memory.\n");
+        device_manager = NULL;
+    }
+
     if (FAILED(hr = MFCreateVideoSampleAllocatorEx(&IID_IMFVideoSampleAllocatorEx, (void **)&allocator)))
         return hr;
     if (FAILED(IMFAttributes_GetUINT32(processor->attributes, &MF_SA_MINIMUM_OUTPUT_SAMPLE_COUNT, &count)))
         count = 2;
-    if (FAILED(hr = IMFVideoSampleAllocatorEx_SetDirectXManager(allocator, processor->device_manager))
+    if (FAILED(hr = IMFVideoSampleAllocatorEx_SetDirectXManager(allocator, device_manager))
             || FAILED(hr = IMFVideoSampleAllocatorEx_InitializeSampleAllocatorEx(allocator, count, max(count + 2, 10),
             processor->output_attributes, processor->output_type)))
     {
@@ -659,6 +667,13 @@ static HRESULT WINAPI video_processor_ProcessMessage(IMFTransform *iface, MFT_ME
     switch (message)
     {
     case MFT_MESSAGE_SET_D3D_MANAGER:
+        /* Refused, the caller keeps bringing samples in system memory. */
+        if (param && processor->output_type && !device_manager_holds_type((IUnknown *)param, processor->output_type))
+        {
+            WARN("The device cannot make textures of the output type, refusing its manager.\n");
+            return MF_E_UNSUPPORTED_D3D_TYPE;
+        }
+
         if (FAILED(hr = video_processor_uninit_allocator(processor)))
             return hr;
 

@@ -117,6 +117,7 @@ void wg_transform_notify_qos(wg_transform_t transform,
 
 HRESULT check_audio_transform_support(const WAVEFORMATEX *input, const WAVEFORMATEX *output);
 HRESULT check_video_transform_support(const MFVIDEOFORMAT *input, const MFVIDEOFORMAT *output);
+BOOL device_manager_holds_type(IUnknown *device_manager, IMFMediaType *type);
 
 HRESULT wg_muxer_create(const char *format, wg_muxer_t *muxer);
 void wg_muxer_destroy(wg_muxer_t muxer);
