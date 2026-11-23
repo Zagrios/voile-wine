@@ -1791,6 +1791,10 @@ static NSString* WineLocalizedString(unsigned int stringID)
         }
         lastHeldScrollTime = timestamp;
 
+        /* Scale by scroll_percent; the fraction carries over. */
+        stepX = stepX * scroll_percent / 100;
+        stepY = stepY * scroll_percent / 100;
+
         if ((heldScrollX < 0 && stepX > 0) || (heldScrollX > 0 && stepX < 0))
             heldScrollX = 0;
         if ((heldScrollY < 0 && stepY > 0) || (heldScrollY > 0 && stepY < 0))
@@ -1891,8 +1895,8 @@ static NSString* WineLocalizedString(unsigned int stringID)
                 /* The x,y values so far are in pixels.  Win32 expects to receive some
                    fraction of WHEEL_DELTA == 120.  By my estimation, that's roughly
                    6 times the pixel value. */
-                x *= 6;
-                y *= 6;
+                x *= 6 * scroll_percent / 100.0;
+                y *= 6 * scroll_percent / 100.0;
 
                 if (use_precise_scrolling)
                 {

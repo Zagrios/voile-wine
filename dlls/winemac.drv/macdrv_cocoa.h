@@ -141,6 +141,7 @@ extern bool allow_immovable_windows;
 extern bool use_confinement_cursor_clipping;
 extern bool cursor_clipping_locks_windows;
 extern bool use_precise_scrolling;
+extern int scroll_percent;
 extern int gl_surface_mode;
 extern CFDictionaryRef localized_strings;
 extern bool retina_enabled;  /* Whether Retina mode is enabled via registry setting. */
