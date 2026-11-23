@@ -1749,6 +1749,64 @@ static NSString* WineLocalizedString(unsigned int stringID)
         forceNextMouseMoveAbsolute = TRUE;
     }
 
+    // While the game holds the cursor, the wheel picks weapons or zooms: send
+    // whole WHEEL_DELTAs only, one per notch of a wheel however fast it turns,
+    // and one per 20 points of a gesture, the same scale as below.  Momentum
+    // and a resting finger send nothing, and the cursor stays where the game
+    // put it.
+    - (BOOL) holdScroll:(macdrv_event*)event fromEvent:(NSEvent*)theEvent continuous:(BOOL)continuous x:(double)x y:(double)y
+    {
+        NSEventPhase phase = [theEvent phase];
+        NSTimeInterval timestamp = [theEvent timestamp];
+        double stepX, stepY;
+
+        if ([theEvent momentumPhase] != NSEventPhaseNone)
+            return FALSE;
+
+        if (phase & (NSEventPhaseBegan | NSEventPhaseEnded | NSEventPhaseCancelled | NSEventPhaseMayBegin))
+            heldScrollX = heldScrollY = 0;
+        if (phase & (NSEventPhaseEnded | NSEventPhaseCancelled | NSEventPhaseMayBegin))
+            return FALSE;
+
+        if (continuous)
+        {
+            /* A smooth wheel has no phases; let a pause end its gesture. */
+            if (phase == NSEventPhaseNone && timestamp - lastHeldScrollTime > 1)
+                heldScrollX = heldScrollY = 0;
+            stepX = x * 6 / 120;
+            stepY = y * 6 / 120;
+        }
+        else
+        {
+            /* The line deltas count notches before acceleration.  Mac and Win32
+               disagree on the sign of horizontal scrolling, as below. */
+            CGEventRef cgevent = [theEvent CGEvent];
+
+            stepX = -CGEventGetIntegerValueField(cgevent, kCGScrollWheelEventDeltaAxis2);
+            stepY = CGEventGetIntegerValueField(cgevent, kCGScrollWheelEventDeltaAxis1);
+
+            /* The parts of one notch share its timestamp. */
+            if ((!stepX && !stepY) || timestamp == lastHeldScrollTime)
+                return FALSE;
+        }
+        lastHeldScrollTime = timestamp;
+
+        if ((heldScrollX < 0 && stepX > 0) || (heldScrollX > 0 && stepX < 0))
+            heldScrollX = 0;
+        if ((heldScrollY < 0 && stepY > 0) || (heldScrollY > 0 && stepY < 0))
+            heldScrollY = 0;
+        heldScrollX += stepX;
+        heldScrollY += stepY;
+
+        event->mouse_scroll.x_scroll = 120 * trunc(heldScrollX);
+        event->mouse_scroll.y_scroll = 120 * trunc(heldScrollY);
+        event->mouse_scroll.keep_cursor = TRUE;
+        heldScrollX -= trunc(heldScrollX);
+        heldScrollY -= trunc(heldScrollY);
+
+        return event->mouse_scroll.x_scroll || event->mouse_scroll.y_scroll;
+    }
+
     - (void) handleScrollWheel:(NSEvent*)theEvent
     {
         WineWindow* window;
@@ -1767,7 +1825,7 @@ static NSString* WineLocalizedString(unsigned int stringID)
             if (self.clippingCursor)
                 [clipCursorHandler clipCursorLocation:&pt];
 
-            if (mouseCaptureWindow)
+            if (mouseCaptureWindow || self.clippingCursor)
                 process = TRUE;
             else
             {
@@ -1821,6 +1879,14 @@ static NSString* WineLocalizedString(unsigned int stringID)
                    Win32: negative is left or down, positive is right or up.
                    So, negate the X scroll value to translate. */
                 x = -x;
+
+                if (self.clippingCursor || clientWantsCursorHidden)
+                {
+                    if ([self holdScroll:event fromEvent:theEvent continuous:continuous x:x y:y])
+                        [window.queue postEvent:event];
+                    macdrv_release_event(event);
+                    return;
+                }
 
                 /* The x,y values so far are in pixels.  Win32 expects to receive some
                    fraction of WHEEL_DELTA == 120.  By my estimation, that's roughly

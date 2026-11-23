@@ -400,6 +400,7 @@ typedef struct macdrv_event {
             int             y_scroll;
             int             x;
             int             y;
+            bool            keep_cursor;
             unsigned long   time_ms;
         }                                           mouse_scroll;
         struct {

@@ -69,6 +69,8 @@ enum {
 
     NSTimeInterval lastScrollTime;
     double accumScrollX, accumScrollY;
+    NSTimeInterval lastHeldScrollTime;
+    double heldScrollX, heldScrollY;
 
     NSMutableDictionary* originalDisplayModes;
     NSMutableDictionary* latentDisplayModes;

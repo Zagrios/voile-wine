@@ -925,17 +925,21 @@ void macdrv_mouse_moved(HWND hwnd, const macdrv_event *event)
  */
 void macdrv_mouse_scroll(HWND hwnd, const macdrv_event *event)
 {
-    TRACE("win %p/%p scroll (%d,%d) at (%d,%d) time %lu (%lu ticks ago)\n", hwnd,
+    /* A game that holds the cursor puts it where it wants it; moving it to
+       where the Mac cursor is would turn the camera. */
+    UINT move = event->mouse_scroll.keep_cursor ? 0 : MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE;
+
+    TRACE("win %p/%p scroll (%d,%d) at (%d,%d)%s time %lu (%lu ticks ago)\n", hwnd,
           event->window, event->mouse_scroll.x_scroll, event->mouse_scroll.y_scroll,
-          event->mouse_scroll.x, event->mouse_scroll.y,
+          event->mouse_scroll.x, event->mouse_scroll.y, event->mouse_scroll.keep_cursor ? " keep cursor" : "",
           event->mouse_scroll.time_ms, (NtGetTickCount() - event->mouse_scroll.time_ms));
 
     if (event->mouse_scroll.y_scroll)
-        send_mouse_input(hwnd, event->window, MOUSEEVENTF_WHEEL | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE,
+        send_mouse_input(hwnd, event->window, MOUSEEVENTF_WHEEL | move,
                          event->mouse_scroll.x, event->mouse_scroll.y,
                          event->mouse_scroll.y_scroll, FALSE, event->mouse_scroll.time_ms);
     if (event->mouse_scroll.x_scroll)
-        send_mouse_input(hwnd, event->window, MOUSEEVENTF_HWHEEL | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE,
+        send_mouse_input(hwnd, event->window, MOUSEEVENTF_HWHEEL | move,
                          event->mouse_scroll.x, event->mouse_scroll.y,
                          event->mouse_scroll.x_scroll, FALSE, event->mouse_scroll.time_ms);
 }
