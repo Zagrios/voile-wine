@@ -378,6 +378,11 @@ static void scale_rect_for_retina_mode(BOOL mode, CGRect *cursorClipRect)
         clip_cursor_location(cursorClipRect, location);
     }
 
+    - (CGRect) heldCursorRect
+    {
+        return cursorClipRect;
+    }
+
     - (void) setRetinaMode:(BOOL)mode
     {
         scale_rect_for_retina_mode(mode, &cursorClipRect);
@@ -494,9 +499,25 @@ static void scale_rect_for_retina_mode(BOOL mode, CGRect *cursorClipRect)
         return TRUE;
     }
 
+    /* The window confines the cursor to the part of the clip rect it covers. */
+    - (CGRect) heldCursorRect
+    {
+        NSWindow *ownerWindow = [NSApp windowWithWindowNumber:clippingWindowNumber];
+        NSRect frame;
+        CGRect rect;
+
+        if (!ownerWindow)
+            return cursorClipRect;
+
+        frame = [ownerWindow frame];
+        [[WineApplicationController sharedController] flipRect:&frame];
+        rect = CGRectIntersection(NSRectToCGRect(frame), cursorClipRect);
+        return CGRectIsNull(rect) ? cursorClipRect : rect;
+    }
+
     - (void) clipCursorLocation:(CGPoint*)location
     {
-        clip_cursor_location(cursorClipRect, location);
+        clip_cursor_location([self heldCursorRect], location);
     }
 
     - (void) setRetinaMode:(BOOL)mode

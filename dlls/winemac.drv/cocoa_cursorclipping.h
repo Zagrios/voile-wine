@@ -32,6 +32,9 @@
 
     - (void) clipCursorLocation:(CGPoint*)location;
 
+    /* The rect the cursor is held in, within cursorClipRect. */
+    - (CGRect) heldCursorRect;
+
     - (void) setRetinaMode:(BOOL)mode;
 
     @optional

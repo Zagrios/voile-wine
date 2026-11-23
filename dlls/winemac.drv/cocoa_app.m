@@ -1453,6 +1453,15 @@ static NSString* WineLocalizedString(unsigned int stringID)
         macdrv_release_event(event);
     }
 
+    - (BOOL) gameHoldsCursorInWindow:(WineWindow*)window atPoint:(NSPoint)point
+    {
+        if (!window || ![NSApp isActive] || ![window isVisible])
+            return FALSE;
+        // Without a clip, the pointer can still go to another display.
+        return self.clippingCursor ||
+               (clientWantsCursorHidden && [window isFullscreen] && NSPointInRect(point, [[window screen] frame]));
+    }
+
     - (void) handleMouseMove:(NSEvent*)anEvent
     {
         WineWindow* targetWindow;
@@ -1479,6 +1488,12 @@ static NSString* WineLocalizedString(unsigned int stringID)
             targetWindow = (WineWindow*)[NSApp windowWithWindowNumber:windowUnderNumber];
             if (!NSMouseInRect(point, [targetWindow contentRectForFrameRect:[targetWindow frame]], NO))
                 targetWindow = nil;
+
+            /* A cursor held at the max edge of a clip is just outside the content
+               rect, and over a fullscreen window the menu bar, the Dock or a
+               notification can be under it.  The game still has the cursor. */
+            if (![targetWindow isKindOfClass:[WineWindow class]] && [self gameHoldsCursorInWindow:lastTargetWindow atPoint:point])
+                targetWindow = lastTargetWindow;
         }
 
         if ([targetWindow isKindOfClass:[WineWindow class]])
@@ -1529,7 +1544,7 @@ static NSString* WineLocalizedString(unsigned int stringID)
 
                 // Assume cursor is pinned for now
                 absolute = FALSE;
-                if (!self.clippingCursor || CGRectContainsPoint(clipCursorHandler.cursorClipRect, computedPoint))
+                if (!self.clippingCursor || CGRectContainsPoint([clipCursorHandler heldCursorRect], computedPoint))
                 {
                     const CGRect* rects;
                     NSUInteger count, i;
