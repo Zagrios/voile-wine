@@ -115,6 +115,7 @@ static UINT64 last_warp_ns;  /* last warp (SetCursorPos, end of relative mode): 
 
 static BOOL latency_trace;
 static BOOL keep_foreground;  /* WINE_OBELISK_KEEP_FOREGROUND, see WSD_EV_APP_DEACTIVATED */
+static int scroll_percent = 100;  /* WINE_OBELISK_SCROLL_PERCENT, 25 to 400 */
 
 static UINT64 now_ns(void)
 {
@@ -1174,6 +1175,10 @@ static BOOL hold_scroll( struct held_scroll *held, const struct wsd_ev_wheel *ev
     }
     held->last_ns = ev->time_ns;
 
+    /* scale by scroll_percent; the fraction carries over */
+    step_x = step_x * scroll_percent / 100;
+    step_y = step_y * scroll_percent / 100;
+
     if ((held->x < 0 && step_x > 0) || (held->x > 0 && step_x < 0)) held->x = 0;
     if ((held->y < 0 && step_y > 0) || (held->y > 0 && step_y < 0)) held->y = 0;
     held->x += step_x;
@@ -1288,6 +1293,7 @@ static void handle_event( const struct wsd_hdr *hdr, const char *payload )
     {
         const struct wsd_ev_wheel *ev = (const void *)payload;
         int wheel_x, wheel_y;
+        double scale;
         if (!hwnd) break;
         /* the game hides the cursor or holds it in a rectangle */
         if (clip_active || !cursor_visible)
@@ -1297,10 +1303,9 @@ static void handle_event( const struct wsd_hdr *hdr, const char *payload )
             if (wheel_x) send_mouse( hwnd, MOUSEEVENTF_HWHEEL, 0, 0, (DWORD)wheel_x );
             break;
         }
-        if (ev->dy) send_mouse( hwnd, MOUSEEVENTF_WHEEL, 0, 0,
-                                (DWORD)(int)(ev->dy * ((ev->precise & WSD_WHEEL_PRECISE) ? 4 : WHEEL_DELTA)) );
-        if (ev->dx) send_mouse( hwnd, MOUSEEVENTF_HWHEEL, 0, 0,
-                                (DWORD)(int)(-ev->dx * ((ev->precise & WSD_WHEEL_PRECISE) ? 4 : WHEEL_DELTA)) );
+        scale = ((ev->precise & WSD_WHEEL_PRECISE) ? 4 : WHEEL_DELTA) * scroll_percent / 100.0;
+        if (ev->dy) send_mouse( hwnd, MOUSEEVENTF_WHEEL, 0, 0, (DWORD)(int)(ev->dy * scale) );
+        if (ev->dx) send_mouse( hwnd, MOUSEEVENTF_HWHEEL, 0, 0, (DWORD)(int)(-ev->dx * scale) );
         break;
     }
     case WSD_EV_FOCUS:
@@ -1569,6 +1574,14 @@ static NTSTATUS obeliskdrv_read_events( void *arg )
 
     latency_trace = getenv( "WINE_OBELISK_LATENCY" ) != NULL;
     keep_foreground = env && *env && *env != '0';
+    /* Obelisk sets a per-game scroll speed */
+    if ((env = getenv( "WINE_OBELISK_SCROLL_PERCENT" )))
+    {
+        char *end;
+        long percent = strtol( env, &end, 10 );
+
+        if (end != env) scroll_percent = percent < 25 ? 25 : percent > 400 ? 400 : percent;
+    }
 
     while (wsd_read( &hdr, payload )) handle_event( &hdr, payload );
     return STATUS_UNSUCCESSFUL;
