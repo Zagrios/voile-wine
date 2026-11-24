@@ -36,12 +36,29 @@
 
 
 @implementation WineMetalLayer
+{
+    CGSize shownDrawableSize, shownSize;  /* what the scaling filter was last picked for */
+}
 
     /* Extend [CAMetalLayer nextDrawable] so client_surface_present() can be
      * called for the corresponding client_surface.
      */
     - (id<CAMetalDrawable>) nextDrawable
     {
+        CGSize drawableSize = self.drawableSize, size = self.bounds.size;
+
+        /* The game sets the drawable's size from its own threads, and the view sizes the layer.
+         * Either changes how the picture is stretched, so the view picks its filter again.
+         */
+        if (!CGSizeEqualToSize(drawableSize, shownDrawableSize) || !CGSizeEqualToSize(size, shownSize))
+        {
+            shownDrawableSize = drawableSize;
+            shownSize = size;
+            if ([self.delegate isKindOfClass:NSClassFromString(@"WineMetalView")])
+                [(NSView *)self.delegate performSelectorOnMainThread:@selector(updateScalingFilter)
+                                                          withObject:nil waitUntilDone:NO];
+        }
+
         /* CAMetalLayer's delegate is the WineMetalView that contains it (seems like that's always true
          * for an NSView backing layer).
          * That WineMetalView's parent is the client_surface->cocoa_view WineContentView, it has the

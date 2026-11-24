@@ -155,6 +155,13 @@ static inline NSUInteger adjusted_modifiers_for_settings(NSUInteger modifiers)
     return new_modifiers;
 }
 
+/* Whether shown is a whole multiple of size, to within a pixel over its whole length. */
+static BOOL is_whole_multiple(CGFloat shown, CGFloat size)
+{
+    CGFloat times = round(shown / size);
+    return times >= 1 && fabs(shown - times * size) <= 1;
+}
+
 static inline BOOL stage_manager_enabled(void)
 {
     /* There is no documented way to determine if Stage Manager is enabled,
@@ -353,6 +360,7 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
 }
 
     - (id) initWithFrame:(NSRect)frame device:(id<MTLDevice>)device;
+    - (void) updateScalingFilter;
 
 @end
 
@@ -994,6 +1002,43 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
     - (BOOL) isOpaque
     {
         return YES;
+    }
+
+    /* Nearest keeps a picture sharp that is shown at a whole multiple of its size. At any
+     * other size it doubles single rows and columns, which makes text grainy: that is
+     * what a game gets that renders below its window's size, or in an emulated mode.
+     */
+    - (void) updateScalingFilter
+    {
+        CAMetalLayer *layer = (CAMetalLayer *)self.layer;
+        CGSize drawable = layer.drawableSize;
+        NSSize shown;
+        NSString *filter;
+
+        if (!self.window || drawable.width < 1 || drawable.height < 1) return;
+
+        /* the pixels of the screen the drawable is stretched over */
+        shown = [self convertRectToBacking:self.bounds].size;
+        if (is_whole_multiple(shown.width, drawable.width) && is_whole_multiple(shown.height, drawable.height))
+            filter = kCAFilterNearest;
+        else
+            filter = kCAFilterLinear;
+
+        if (![layer.magnificationFilter isEqualToString:filter])
+            layer.magnificationFilter = filter;
+    }
+
+    - (void) viewDidMoveToWindow
+    {
+        [super viewDidMoveToWindow];
+        [self updateScalingFilter];
+    }
+
+    /* the window went to a screen with another scale, or the screen's mode changed */
+    - (void) viewDidChangeBackingProperties
+    {
+        [super viewDidChangeBackingProperties];
+        [self updateScalingFilter];
     }
 
 @end
