@@ -172,6 +172,13 @@ static NSString *forced_scaling_filter(void)
     return nil;
 }
 
+/* Whether win32u emulates display modes for this game. */
+static BOOL emulates_modes(void)
+{
+    const char *env = getenv("WINE_OBELISK_EMULATE_MODES");
+    return env && *env && *env != '0';
+}
+
 static inline BOOL stage_manager_enabled(void)
 {
     /* There is no documented way to determine if Stage Manager is enabled,
@@ -367,10 +374,13 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
 @interface WineMetalView : WineBaseView
 {
     id<MTLDevice> _device;
+    BOOL keepsShape;  /* active again, but the game has not set its mode yet */
 }
 
     - (id) initWithFrame:(NSRect)frame device:(id<MTLDevice>)device;
     - (void) updateScalingFilter;
+    - (void) updateContentsGravity;
+    - (void) appDidBecomeActive;
 
 @end
 
@@ -982,14 +992,52 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
             _device = [device retain];
             self.wantsLayer = YES;
             self.layerContentsRedrawPolicy = NSViewLayerContentsRedrawNever;
+
+            if (emulates_modes())
+            {
+                NSNotificationCenter* nc = [NSNotificationCenter defaultCenter];
+                [nc addObserver:self
+                       selector:@selector(appDidBecomeActive)
+                           name:NSApplicationDidBecomeActiveNotification
+                         object:NSApp];
+                [nc addObserver:self
+                       selector:@selector(updateContentsGravity)
+                           name:NSApplicationDidResignActiveNotification
+                         object:NSApp];
+            }
         }
         return self;
     }
 
     - (void) dealloc
     {
+        [[NSNotificationCenter defaultCenter] removeObserver:self];
+        [NSObject cancelPreviousPerformRequestsWithTarget:self];
         [_device release];
         [super dealloc];
+    }
+
+    /* A fullscreen game that loses the focus gives the desktop its mode back and goes on
+     * drawing. With emulated modes its window then covers the screen, and its picture, made
+     * for the mode it had, would be stretched over it. Nothing aims at the picture of an
+     * inactive game, so it keeps its shape until the game is active again.
+     */
+    - (void) updateContentsGravity
+    {
+        if (!emulates_modes()) return;
+        [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(updateContentsGravity) object:nil];
+        keepsShape = NO;
+        self.layer.contentsGravity = [NSApp isActive] ? kCAGravityResize : kCAGravityResizeAspect;
+    }
+
+    /* The game takes a moment to set its mode again. Until the layer's size or the drawable's
+     * changes for that, the picture keeps its shape, and for three seconds at most: a game
+     * that sets no mode has the pointer aimed at a picture that fills the layer.
+     */
+    - (void) appDidBecomeActive
+    {
+        keepsShape = YES;
+        [self performSelector:@selector(updateContentsGravity) withObject:nil afterDelay:3];
     }
 
     - (void) setRetinaMode:(BOOL)mode
@@ -1025,6 +1073,8 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
         NSSize shown;
         NSString *filter;
 
+        if (keepsShape) [self updateContentsGravity];
+
         if (!self.window || drawable.width < 1 || drawable.height < 1) return;
 
         if (!(filter = forced_scaling_filter()))
@@ -1045,6 +1095,7 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
     {
         [super viewDidMoveToWindow];
         [self updateScalingFilter];
+        [self updateContentsGravity];
     }
 
     /* the window went to a screen with another scale, or the screen's mode changed */
