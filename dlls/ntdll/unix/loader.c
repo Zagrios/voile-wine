@@ -661,6 +661,46 @@ static void replace_wineloader_path_with_link(char **wineloader_path, const char
 }
 #endif
 
+#if defined(__APPLE__) && !defined(HAVE_WINE_PRELOADER)
+/* A game's own programs, as opposed to Wine's and to programs named without a path. */
+static BOOL is_game_program( const char *path )
+{
+    static const char * const system_dirs[] = { "system32", "syswow64" };
+    const char *p = path;
+    unsigned int i;
+
+    if (!path || !strpbrk( path, "/\\" )) return FALSE;
+    while ((p = strpbrk( p, "/\\" )))
+    {
+        p++;
+        for (i = 0; i < ARRAY_SIZE(system_dirs); i++)
+        {
+            size_t len = strlen( system_dirs[i] );
+            if (!strncasecmp( p, system_dirs[i], len ) && (p[len] == '/' || p[len] == '\\')) return FALSE;
+        }
+        /* regedit, notepad and the like sit in C:\windows itself */
+        if (((p - path >= 8 && !strncasecmp( p - 8, "drive_c", 7 )) || (p - path >= 3 && p[-2] == ':')) &&
+            !strncasecmp( p, "windows", 7 ) && (p[7] == '/' || p[7] == '\\') && !strpbrk( p + 8, "/\\" ))
+            return FALSE;
+    }
+    return TRUE;
+}
+
+/* Obelisk builds an application bundle for each game, holding a copy of the loader and a link to
+ * ntdll.so in Contents/MacOS, so that macOS sees the game's programs as a game (Game Mode). */
+static void game_bundle_exec( char **argv, const char *image_path )
+{
+    const char *bundle = getenv( "WINE_OBELISK_GAME_BUNDLE" );
+    char *loader;
+
+    if (!bundle || bundle[0] != '/' || !is_game_program( image_path )) return;
+    if (asprintf( &loader, "%s/Contents/MacOS/wine", bundle ) == -1) return;
+    argv[1] = loader;
+    execv( argv[1], argv + 1 );
+    free( loader );
+}
+#endif
+
 
 static void preloader_exec( char **argv, const char *image_path )
 {
@@ -706,6 +746,9 @@ static NTSTATUS loader_exec( char **argv, WORD machine, const char *image_path )
 
     if (((argv[1] = get_alternate_wineloader( machine )))) preloader_exec( argv, image_path );
 
+#if defined(__APPLE__) && !defined(HAVE_WINE_PRELOADER)
+    game_bundle_exec( argv, image_path );
+#endif
     argv[1] = strdup( wineloader );
     preloader_exec( argv, image_path );
     return STATUS_INVALID_IMAGE_FORMAT;
@@ -2677,7 +2720,7 @@ static void reexec_loader( int argc, char *argv[], char *extra_arg )
     /* default to 32-bit loader to support 32-bit prefixes */
     if (machine == IMAGE_FILE_MACHINE_AMD64) machine = IMAGE_FILE_MACHINE_I386;
 
-    loader_exec( new_argv, machine, argv[0] );
+    loader_exec( new_argv, machine, new_argv[2] );
     fatal_error( "could not exec the wine loader\n" );
 }
 
