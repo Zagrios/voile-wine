@@ -162,6 +162,16 @@ static BOOL is_whole_multiple(CGFloat shown, CGFloat size)
     return times >= 1 && fabs(shown - times * size) <= 1;
 }
 
+/* WINE_OBELISK_SCALING: "nearest" or "linear" for a game's picture at every size. */
+static NSString *forced_scaling_filter(void)
+{
+    const char *env = getenv("WINE_OBELISK_SCALING");
+
+    if (env && !strcmp(env, "nearest")) return kCAFilterNearest;
+    if (env && !strcmp(env, "linear")) return kCAFilterLinear;
+    return nil;
+}
+
 static inline BOOL stage_manager_enabled(void)
 {
     /* There is no documented way to determine if Stage Manager is enabled,
@@ -1017,12 +1027,15 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
 
         if (!self.window || drawable.width < 1 || drawable.height < 1) return;
 
-        /* the pixels of the screen the drawable is stretched over */
-        shown = [self convertRectToBacking:self.bounds].size;
-        if (is_whole_multiple(shown.width, drawable.width) && is_whole_multiple(shown.height, drawable.height))
-            filter = kCAFilterNearest;
-        else
-            filter = kCAFilterLinear;
+        if (!(filter = forced_scaling_filter()))
+        {
+            /* the pixels of the screen the drawable is stretched over */
+            shown = [self convertRectToBacking:self.bounds].size;
+            if (is_whole_multiple(shown.width, drawable.width) && is_whole_multiple(shown.height, drawable.height))
+                filter = kCAFilterNearest;
+            else
+                filter = kCAFilterLinear;
+        }
 
         if (![layer.magnificationFilter isEqualToString:filter])
             layer.magnificationFilter = filter;
