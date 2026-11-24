@@ -1110,6 +1110,12 @@ static BOOL read_gpu_from_registry( struct gpu *gpu )
 
 static const char* driver_vendor_to_version( UINT16 vendor )
 {
+    const char *env = getenv( "D3DM_ENABLE_METALFX" );
+
+    /* D3DMetal then presents an NVIDIA adapter, to run a game's DLSS on MetalFX, and the
+     * game reads the version as NVIDIA's: the default would be driver 010.00 to it. */
+    if (env && *env && *env != '0') vendor = 0x10de;
+
     /* The last seven digits are the driver number. */
     switch (vendor)
     {
