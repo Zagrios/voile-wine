@@ -5844,6 +5844,7 @@ void sysparams_init(void)
     pthread_mutexattr_t attr;
     HKEY hkey, appkey = 0;
     DWORD len;
+    const char *env;
 
     static const WCHAR oneW[] = {'1',0};
     static const WCHAR x11driverW[] = {'\\','X','1','1',' ','D','r','i','v','e','r',0};
@@ -5942,6 +5943,10 @@ void sysparams_init(void)
         decorated_mode = IS_OPTION_TRUE( buffer[0] );
     if (!get_config_key( hkey, appkey, "EmulateModeset", buffer, sizeof(buffer) ))
         emulate_modeset = IS_OPTION_TRUE( buffer[0] );
+
+    /* Obelisk turns mode emulation on for a game without touching its prefix */
+    if ((env = getenv( "WINE_OBELISK_EMULATE_MODES" )) && *env && *env != '0')
+        emulate_modeset = TRUE;
 
 #undef IS_OPTION_TRUE
 
