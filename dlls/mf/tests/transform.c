@@ -255,6 +255,27 @@ static IMFMediaType *transform_find_available_output_type(IMFTransform *transfor
     return output_type;
 }
 
+static void check_output_types_listed_once(IMFTransform *transform)
+{
+    IMFMediaType *media_type;
+    GUID subtypes[32];
+    UINT i, j;
+    HRESULT hr;
+
+    for (i = 0; i < ARRAY_SIZE(subtypes); i++)
+    {
+        if (FAILED(IMFTransform_GetOutputAvailableType(transform, 0, i, &media_type)))
+            break;
+        hr = IMFMediaType_GetGUID(media_type, &MF_MT_SUBTYPE, &subtypes[i]);
+        ok(hr == S_OK, "GetGUID returned %#lx.\n", hr);
+        IMFMediaType_Release(media_type);
+
+        for (j = 0; j < i; j++)
+            ok(!IsEqualGUID(&subtypes[j], &subtypes[i]), "Output type %u is output type %u again, %s.\n",
+                    i, j, debugstr_guid(&subtypes[i]));
+    }
+}
+
 #define EXPECT_REF(obj,ref) _expect_ref((IUnknown*)obj, ref, __LINE__)
 static void _expect_ref(IUnknown* obj, ULONG expected_refcount, int line)
 {
@@ -4916,6 +4937,10 @@ static void test_h264_decoder(void)
     }
     ok(hr == MF_E_NO_MORE_TYPES, "GetOutputAvailableType returned %#lx\n", hr);
     ok(i == 5, "%lu output media types\n", i);
+
+    check_output_types_listed_once(transform);
+    if ((media_type = transform_find_available_output_type(transform, &MFVideoFormat_NV12)))
+        IMFMediaType_Release(media_type);
 
     check_mft_set_output_type_required(transform, output_type_desc);
     check_mft_set_output_type(transform, output_type_desc, S_OK);

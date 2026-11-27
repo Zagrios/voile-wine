@@ -447,7 +447,7 @@ done:
  * the video formats: asked for such a texture, DXMT fails and D3DMetal stops the process, so
  * the device is asked what it supports and never for a texture. A Direct3D 9 manager, and a
  * manager that has no device yet, are taken as they always were. */
-static BOOL device_manager_holds_type(IUnknown *device_manager, IMFMediaType *type)
+BOOL device_manager_holds_type(IUnknown *device_manager, IMFMediaType *type)
 {
     IMFDXGIDeviceManager *manager;
     ID3D11Device *device;
@@ -641,7 +641,6 @@ static HRESULT WINAPI transform_GetInputAvailableType(IMFTransform *iface, DWORD
     return MFCreateVideoMediaTypeFromSubtype(decoder->input_types[index], (IMFVideoMediaType **)type);
 }
 
-/* CW HACK 26265 */
 extern void CDECL wine_get_host_version( const char **sysname, const char **release );
 
 static BOOL is_macos(void)
@@ -656,6 +655,7 @@ static HRESULT WINAPI transform_GetOutputAvailableType(IMFTransform *iface, DWOR
         DWORD index, IMFMediaType **type)
 {
     struct video_decoder *decoder = impl_from_IMFTransform(iface);
+    UINT i;
 
     TRACE("iface %p, id %#lx, index %#lx, type %p.\n", iface, id, index, type);
 
@@ -665,14 +665,19 @@ static HRESULT WINAPI transform_GetOutputAvailableType(IMFTransform *iface, DWOR
     if (index >= decoder->output_type_count)
         return MF_E_NO_MORE_TYPES;
 
-    /* CW HACK 26265 */
-    if (is_macos() && IsEqualGUID(decoder->output_types[index], &MFVideoFormat_NV12))
+    /* On macOS NV12 comes last, so callers taking the first type get what they got before. */
+    if (is_macos())
     {
-        WARN("Skipping NV12 output format\n");
-        index++;
-
-        if (index >= decoder->output_type_count)
-            return MF_E_NO_MORE_TYPES;
+        for (i = 0; i < decoder->output_type_count; ++i)
+            if (IsEqualGUID(decoder->output_types[i], &MFVideoFormat_NV12))
+                break;
+        if (i < decoder->output_type_count)
+        {
+            if (index == decoder->output_type_count - 1)
+                index = i;
+            else if (index >= i)
+                index++;
+        }
     }
 
     return create_output_media_type(decoder, decoder->output_types[index], NULL, type);
