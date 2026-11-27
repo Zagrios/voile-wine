@@ -729,6 +729,7 @@ static CGDisplayModeRef find_best_display_mode(DEVMODEW *devmode, CFArrayRef dis
 {
     CFIndex count, i, best;
     CGDisplayModeRef best_display_mode;
+    double best_refresh_rate = 0;
 
     best_display_mode = NULL;
 
@@ -742,6 +743,7 @@ static CGDisplayModeRef find_best_display_mode(DEVMODEW *devmode, CFArrayRef dis
         size_t width = CGDisplayModeGetWidth(display_mode);
         size_t height = CGDisplayModeGetHeight(display_mode);
         double refresh_rate = CGDisplayModeGetRefreshRate(display_mode);
+        BOOL restores;
         if (!refresh_rate)
             refresh_rate = 60;
 
@@ -758,21 +760,31 @@ static CGDisplayModeRef find_best_display_mode(DEVMODEW *devmode, CFArrayRef dis
             continue;
         if (devmode->dmPelsHeight != height)
             continue;
-        if (devmode->dmDisplayFrequency != (DWORD)refresh_rate)
+        /* A faster rate than asked for is fine, and keeps a ProMotion display
+           from dropping to 60 Hz. */
+        if ((DWORD)refresh_rate < devmode->dmDisplayFrequency)
             continue;
         if (!(devmode->dmDisplayFlags & DM_INTERLACED) != !(io_flags & kDisplayModeInterlacedFlag))
             continue;
         if (!(devmode->dmDisplayFixedOutput == DMDFO_STRETCH) != !(io_flags & kDisplayModeStretchedFlag))
             continue;
 
-        if (best_display_mode)
+        /* The desktop's own mode at the rate asked for restores it. */
+        restores = is_original && (DWORD)refresh_rate == devmode->dmDisplayFrequency;
+        if (!restores && best_display_mode && refresh_rate <= best_refresh_rate)
             continue;
 
         best_display_mode = display_mode;
+        best_refresh_rate = refresh_rate;
         best = i;
+        if (restores)
+            break;
     }
 
-    if (best_display_mode)
+    if (best_display_mode && (DWORD)best_refresh_rate != devmode->dmDisplayFrequency)
+        TRACE("Requested display settings match mode %ld at %u Hz instead of %u Hz\n", best,
+              (unsigned int)best_refresh_rate, (unsigned int)devmode->dmDisplayFrequency);
+    else if (best_display_mode)
         TRACE("Requested display settings match mode %ld\n", best);
 
     return best_display_mode;
