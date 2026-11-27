@@ -57,6 +57,7 @@ bool allow_immovable_windows = true;
 bool use_confinement_cursor_clipping = true;
 bool cursor_clipping_locks_windows = true;
 bool use_precise_scrolling = true;
+int scroll_percent = 100;
 int gl_surface_mode = GL_SURFACE_IN_FRONT_OPAQUE;
 bool retina_enabled = false;
 bool enable_app_nap = false;
@@ -287,6 +288,7 @@ static void setup_options(void)
     WCHAR buffer[MAX_PATH + 16], *p, *appname;
     HKEY hkey, appkey = 0;
     DWORD len;
+    const char *env;
 
     /* @@ Wine registry key: HKCU\Software\Wine\Mac Driver */
     hkey = open_hkcu_key("Software\\Wine\\Mac Driver");
@@ -388,6 +390,16 @@ static void setup_options(void)
 
     if (!get_config_key(hkey, appkey, "EnableAppNap", buffer, sizeof(buffer)))
         enable_app_nap = IS_OPTION_TRUE(buffer[0]);
+
+    /* Obelisk sets a per-game scroll speed. */
+    if ((env = getenv("WINE_OBELISK_SCROLL_PERCENT")))
+    {
+        char *end;
+        long percent = strtol(env, &end, 10);
+
+        if (end != env)
+            scroll_percent = percent < 25 ? 25 : percent > 400 ? 400 : percent;
+    }
 
     /* Don't use appkey.  The DPI and monitor sizes should be consistent for all
        processes in the prefix. */
