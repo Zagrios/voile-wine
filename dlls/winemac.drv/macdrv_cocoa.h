@@ -110,6 +110,12 @@ enum {
 };
 
 enum {
+    SCALING_FILTER_AUTO,
+    SCALING_FILTER_NEAREST,
+    SCALING_FILTER_LINEAR,
+};
+
+enum {
     MACDRV_HOTKEY_SUCCESS,
     MACDRV_HOTKEY_ALREADY_REGISTERED,
     MACDRV_HOTKEY_FAILURE,
@@ -142,6 +148,8 @@ extern bool use_confinement_cursor_clipping;
 extern bool cursor_clipping_locks_windows;
 extern bool use_precise_scrolling;
 extern int scroll_percent;
+extern int scaling_filter;
+extern bool emulate_modes;
 extern int gl_surface_mode;
 extern CFDictionaryRef localized_strings;
 extern bool retina_enabled;  /* Whether Retina mode is enabled via registry setting. */

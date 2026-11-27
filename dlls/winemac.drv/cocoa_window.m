@@ -155,6 +155,13 @@ static inline NSUInteger adjusted_modifiers_for_settings(NSUInteger modifiers)
     return new_modifiers;
 }
 
+/* Whether shown is a whole multiple of size, to within a pixel over its whole length. */
+static BOOL is_whole_multiple(CGFloat shown, CGFloat size)
+{
+    CGFloat times = round(shown / size);
+    return times >= 1 && fabs(shown - times * size) <= 1;
+}
+
 static inline BOOL stage_manager_enabled(void)
 {
     /* There is no documented way to determine if Stage Manager is enabled,
@@ -350,9 +357,13 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
 @interface WineMetalView : WineBaseView
 {
     id<MTLDevice> _device;
+    BOOL keepsShape;  /* active again, but the game has not set its mode yet */
 }
 
     - (id) initWithFrame:(NSRect)frame device:(id<MTLDevice>)device;
+    - (void) updateScalingFilter;
+    - (void) updateContentsGravity;
+    - (void) appDidBecomeActive;
 
 @end
 
@@ -964,14 +975,52 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
             _device = [device retain];
             self.wantsLayer = YES;
             self.layerContentsRedrawPolicy = NSViewLayerContentsRedrawNever;
+
+            if (emulate_modes)
+            {
+                NSNotificationCenter* nc = [NSNotificationCenter defaultCenter];
+                [nc addObserver:self
+                       selector:@selector(appDidBecomeActive)
+                           name:NSApplicationDidBecomeActiveNotification
+                         object:NSApp];
+                [nc addObserver:self
+                       selector:@selector(updateContentsGravity)
+                           name:NSApplicationDidResignActiveNotification
+                         object:NSApp];
+            }
         }
         return self;
     }
 
     - (void) dealloc
     {
+        [[NSNotificationCenter defaultCenter] removeObserver:self];
+        [NSObject cancelPreviousPerformRequestsWithTarget:self];
         [_device release];
         [super dealloc];
+    }
+
+    /* A fullscreen game that loses the focus gives the desktop its mode back and goes on
+     * drawing. With emulated modes its window then covers the screen, and its picture, made
+     * for the mode it had, would be stretched over it. Nothing aims at the picture of an
+     * inactive game, so it keeps its shape until the game is active again.
+     */
+    - (void) updateContentsGravity
+    {
+        if (!emulate_modes) return;
+        [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(updateContentsGravity) object:nil];
+        keepsShape = NO;
+        self.layer.contentsGravity = [NSApp isActive] ? kCAGravityResize : kCAGravityResizeAspect;
+    }
+
+    /* The game takes a moment to set its mode again. Until the layer's size or the drawable's
+     * changes for that, the picture keeps its shape, and for three seconds at most: a game
+     * that sets no mode has the pointer aimed at a picture that fills the layer.
+     */
+    - (void) appDidBecomeActive
+    {
+        keepsShape = YES;
+        [self performSelector:@selector(updateContentsGravity) withObject:nil afterDelay:3];
     }
 
     - (void) setRetinaMode:(BOOL)mode
@@ -994,6 +1043,53 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
     - (BOOL) isOpaque
     {
         return YES;
+    }
+
+    /* Nearest keeps a picture sharp that is shown at a whole multiple of its size. At any
+     * other size it doubles single rows and columns, which makes text grainy: that is
+     * what a game gets that renders below its window's size, or in an emulated mode.
+     */
+    - (void) updateScalingFilter
+    {
+        CAMetalLayer *layer = (CAMetalLayer *)self.layer;
+        CGSize drawable = layer.drawableSize;
+        NSSize shown;
+        NSString *filter;
+
+        if (keepsShape) [self updateContentsGravity];
+
+        if (!self.window || drawable.width < 1 || drawable.height < 1) return;
+
+        if (scaling_filter == SCALING_FILTER_NEAREST)
+            filter = kCAFilterNearest;
+        else if (scaling_filter == SCALING_FILTER_LINEAR)
+            filter = kCAFilterLinear;
+        else
+        {
+            /* the pixels of the screen the drawable is stretched over */
+            shown = [self convertRectToBacking:self.bounds].size;
+            if (is_whole_multiple(shown.width, drawable.width) && is_whole_multiple(shown.height, drawable.height))
+                filter = kCAFilterNearest;
+            else
+                filter = kCAFilterLinear;
+        }
+
+        if (![layer.magnificationFilter isEqualToString:filter])
+            layer.magnificationFilter = filter;
+    }
+
+    - (void) viewDidMoveToWindow
+    {
+        [super viewDidMoveToWindow];
+        [self updateScalingFilter];
+        [self updateContentsGravity];
+    }
+
+    /* the window went to a screen with another scale, or the screen's mode changed */
+    - (void) viewDidChangeBackingProperties
+    {
+        [super viewDidChangeBackingProperties];
+        [self updateScalingFilter];
     }
 
 @end
