@@ -221,6 +221,7 @@ static NSString* WineLocalizedString(unsigned int stringID)
     {
         [windowsBeingDragged release];
         [cursor release];
+        [invisibleCursor release];
         [screenFrameCGRects release];
         [applicationIcon release];
         [clipCursorHandler release];
@@ -852,6 +853,8 @@ static NSString* WineLocalizedString(unsigned int stringID)
     {
         [self updateFullscreenWindows];
         [self adjustWindowLevels];
+        if ([NSApp isActive])
+            [self rehideCursor:TRUE];
     }
 
     - (void) sendDisplaysChanged:(BOOL)activating
@@ -1054,10 +1057,17 @@ static NSString* WineLocalizedString(unsigned int stringID)
                 cursorHidden = TRUE;
             }
 
-            if (!cursorIsCurrent)
+            if (clientWantsCursorHidden && !cursorIsInvisible)
+            {
+                [[self invisibleCursor] set];
+                cursorIsInvisible = TRUE;
+                cursorIsCurrent = FALSE;
+            }
+            else if (!clientWantsCursorHidden && !cursorIsCurrent)
             {
                 [cursor set];
                 cursorIsCurrent = TRUE;
+                cursorIsInvisible = FALSE;
             }
 
             if (!clientWantsCursorHidden && cursorHidden)
@@ -1068,10 +1078,11 @@ static NSString* WineLocalizedString(unsigned int stringID)
         }
         else
         {
-            if (cursorIsCurrent)
+            if (cursorIsCurrent || cursorIsInvisible)
             {
                 [[NSCursor arrowCursor] set];
                 cursorIsCurrent = FALSE;
+                cursorIsInvisible = FALSE;
             }
             if (cursorHidden)
             {
@@ -1079,6 +1090,43 @@ static NSString* WineLocalizedString(unsigned int stringID)
                 cursorHidden = FALSE;
             }
         }
+    }
+
+    - (NSCursor*) invisibleCursor
+    {
+        if (!invisibleCursor)
+        {
+            NSImage* image = [[NSImage alloc] initWithSize:NSMakeSize(16, 16)];
+            invisibleCursor = [[NSCursor alloc] initWithImage:image hotSpot:NSZeroPoint];
+            [image release];
+        }
+        return invisibleCursor;
+    }
+
+    // macOS shows the cursor again (Dock, menu bar, activation, Space change)
+    // without telling us.  While hidden, keep the empty cursor set and redo
+    // the hide once back over our window; unhide+hide keeps the count at one.
+    - (void) rehideCursor:(BOOL)force
+    {
+        NSTimeInterval now;
+
+        if (!cursorHidden || !clientWantsCursorHidden)
+            return;
+
+        now = [[NSProcessInfo processInfo] systemUptime];
+        if (force || cursorMayBeShown)
+        {
+            [NSCursor unhide];
+            [NSCursor hide];
+            cursorMayBeShown = FALSE;
+        }
+        else if (now - lastInvisibleCursorTime < 0.1)
+            return;
+
+        [[self invisibleCursor] set];
+        cursorIsInvisible = TRUE;
+        cursorIsCurrent = FALSE;
+        lastInvisibleCursorTime = now;
     }
 
     - (void) hideCursor
@@ -1453,10 +1501,20 @@ static NSString* WineLocalizedString(unsigned int stringID)
         macdrv_release_event(event);
     }
 
+    - (BOOL) gameHoldsCursorInWindow:(WineWindow*)window atPoint:(NSPoint)point
+    {
+        if (!window || ![NSApp isActive] || ![window isVisible])
+            return FALSE;
+        // Without a clip, the pointer can still go to another display.
+        return self.clippingCursor ||
+               (clientWantsCursorHidden && [window isFullscreen] && NSPointInRect(point, [[window screen] frame]));
+    }
+
     - (void) handleMouseMove:(NSEvent*)anEvent
     {
         WineWindow* targetWindow;
         BOOL drag = [anEvent type] != NSEventTypeMouseMoved;
+        BOOL overOtherWindow = FALSE;
 
         if ([windowsBeingDragged count])
             targetWindow = nil;
@@ -1477,8 +1535,15 @@ static NSString* WineLocalizedString(unsigned int stringID)
             windowUnderNumber = [NSWindow windowNumberAtPoint:point
                                   belowWindowWithWindowNumber:0];
             targetWindow = (WineWindow*)[NSApp windowWithWindowNumber:windowUnderNumber];
+            overOtherWindow = ![targetWindow isKindOfClass:[WineWindow class]];
             if (!NSMouseInRect(point, [targetWindow contentRectForFrameRect:[targetWindow frame]], NO))
                 targetWindow = nil;
+
+            /* A cursor held at the max edge of a clip is just outside the content
+               rect, and over a fullscreen window the menu bar, the Dock or a
+               notification can be under it.  The game still has the cursor. */
+            if (![targetWindow isKindOfClass:[WineWindow class]] && [self gameHoldsCursorInWindow:lastTargetWindow atPoint:point])
+                targetWindow = lastTargetWindow;
         }
 
         if ([targetWindow isKindOfClass:[WineWindow class]])
@@ -1529,7 +1594,7 @@ static NSString* WineLocalizedString(unsigned int stringID)
 
                 // Assume cursor is pinned for now
                 absolute = FALSE;
-                if (!self.clippingCursor || CGRectContainsPoint(clipCursorHandler.cursorClipRect, computedPoint))
+                if (!self.clippingCursor || CGRectContainsPoint([clipCursorHandler heldCursorRect], computedPoint))
                 {
                     const CGRect* rects;
                     NSUInteger count, i;
@@ -1598,6 +1663,11 @@ static NSString* WineLocalizedString(unsigned int stringID)
             lastTargetWindow = nil;
 
         [self updateCursor:FALSE];
+
+        if (overOtherWindow)
+            cursorMayBeShown = TRUE;
+        else
+            [self rehideCursor:FALSE];
     }
 
     - (void) handleMouseButton:(NSEvent*)theEvent
@@ -1749,6 +1819,68 @@ static NSString* WineLocalizedString(unsigned int stringID)
         forceNextMouseMoveAbsolute = TRUE;
     }
 
+    // While the game holds the cursor, the wheel picks weapons or zooms: send
+    // whole WHEEL_DELTAs only, one per notch of a wheel however fast it turns,
+    // and one per 20 points of a gesture, the same scale as below.  Momentum
+    // and a resting finger send nothing, and the cursor stays where the game
+    // put it.
+    - (BOOL) holdScroll:(macdrv_event*)event fromEvent:(NSEvent*)theEvent continuous:(BOOL)continuous x:(double)x y:(double)y
+    {
+        NSEventPhase phase = [theEvent phase];
+        NSTimeInterval timestamp = [theEvent timestamp];
+        double stepX, stepY;
+
+        if ([theEvent momentumPhase] != NSEventPhaseNone)
+            return FALSE;
+
+        if (phase & (NSEventPhaseBegan | NSEventPhaseEnded | NSEventPhaseCancelled | NSEventPhaseMayBegin))
+            heldScrollX = heldScrollY = 0;
+        if (phase & (NSEventPhaseEnded | NSEventPhaseCancelled | NSEventPhaseMayBegin))
+            return FALSE;
+
+        if (continuous)
+        {
+            /* A smooth wheel has no phases; let a pause end its gesture. */
+            if (phase == NSEventPhaseNone && timestamp - lastHeldScrollTime > 1)
+                heldScrollX = heldScrollY = 0;
+            stepX = x * 6 / 120;
+            stepY = y * 6 / 120;
+        }
+        else
+        {
+            /* The line deltas count notches before acceleration.  Mac and Win32
+               disagree on the sign of horizontal scrolling, as below. */
+            CGEventRef cgevent = [theEvent CGEvent];
+
+            stepX = -CGEventGetIntegerValueField(cgevent, kCGScrollWheelEventDeltaAxis2);
+            stepY = CGEventGetIntegerValueField(cgevent, kCGScrollWheelEventDeltaAxis1);
+
+            /* The parts of one notch share its timestamp. */
+            if ((!stepX && !stepY) || timestamp == lastHeldScrollTime)
+                return FALSE;
+        }
+        lastHeldScrollTime = timestamp;
+
+        /* Scale by scroll_percent; the fraction carries over. */
+        stepX = stepX * scroll_percent / 100;
+        stepY = stepY * scroll_percent / 100;
+
+        if ((heldScrollX < 0 && stepX > 0) || (heldScrollX > 0 && stepX < 0))
+            heldScrollX = 0;
+        if ((heldScrollY < 0 && stepY > 0) || (heldScrollY > 0 && stepY < 0))
+            heldScrollY = 0;
+        heldScrollX += stepX;
+        heldScrollY += stepY;
+
+        event->mouse_scroll.x_scroll = 120 * trunc(heldScrollX);
+        event->mouse_scroll.y_scroll = 120 * trunc(heldScrollY);
+        event->mouse_scroll.keep_cursor = TRUE;
+        heldScrollX -= trunc(heldScrollX);
+        heldScrollY -= trunc(heldScrollY);
+
+        return event->mouse_scroll.x_scroll || event->mouse_scroll.y_scroll;
+    }
+
     - (void) handleScrollWheel:(NSEvent*)theEvent
     {
         WineWindow* window;
@@ -1767,7 +1899,7 @@ static NSString* WineLocalizedString(unsigned int stringID)
             if (self.clippingCursor)
                 [clipCursorHandler clipCursorLocation:&pt];
 
-            if (mouseCaptureWindow)
+            if (mouseCaptureWindow || self.clippingCursor)
                 process = TRUE;
             else
             {
@@ -1822,11 +1954,19 @@ static NSString* WineLocalizedString(unsigned int stringID)
                    So, negate the X scroll value to translate. */
                 x = -x;
 
+                if (self.clippingCursor || clientWantsCursorHidden)
+                {
+                    if ([self holdScroll:event fromEvent:theEvent continuous:continuous x:x y:y])
+                        [window.queue postEvent:event];
+                    macdrv_release_event(event);
+                    return;
+                }
+
                 /* The x,y values so far are in pixels.  Win32 expects to receive some
                    fraction of WHEEL_DELTA == 120.  By my estimation, that's roughly
                    6 times the pixel value. */
-                x *= 6;
-                y *= 6;
+                x *= 6 * scroll_percent / 100.0;
+                y *= 6 * scroll_percent / 100.0;
 
                 if (use_precise_scrolling)
                 {
@@ -2493,6 +2633,8 @@ static NSString* WineLocalizedString(unsigned int stringID)
         // movement deltas are invalidated.  Make sure the next mouse move event
         // starts over from an absolute baseline.
         forceNextMouseMoveAbsolute = TRUE;
+
+        [self rehideCursor:TRUE];
     }
 
     - (void)applicationDidChangeScreenParameters:(NSNotification *)notification

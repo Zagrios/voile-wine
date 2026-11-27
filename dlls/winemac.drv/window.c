@@ -1966,7 +1966,13 @@ void macdrv_window_did_unminimize(HWND hwnd)
     {
         TRACE("restoring win %p/%p\n", hwnd, data->cocoa_window);
         release_win_data(data);
-        NtUserSetActiveWindow(hwnd);
+        /* The window comes back because its app is being activated: Cocoa
+         * makes it key next. Make it the foreground window before restoring
+         * it. Activating it first under another foreground window would leave
+         * the later WINDOW_GOT_FOCUS with nothing to tell the app, which then
+         * never learns that it is active again. */
+        if (!can_window_become_foreground(hwnd) || !NtUserSetForegroundWindowInternal(hwnd))
+            NtUserSetActiveWindow(hwnd);
         send_message(hwnd, WM_SYSCOMMAND, SC_RESTORE, 0);
         return;
     }

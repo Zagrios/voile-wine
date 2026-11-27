@@ -69,6 +69,8 @@ enum {
 
     NSTimeInterval lastScrollTime;
     double accumScrollX, accumScrollY;
+    NSTimeInterval lastHeldScrollTime;
+    double heldScrollX, heldScrollY;
 
     NSMutableDictionary* originalDisplayModes;
     NSMutableDictionary* latentDisplayModes;
@@ -83,6 +85,10 @@ enum {
     BOOL        cursorIsCurrent;
     BOOL        cursorHidden;
     BOOL        clientWantsCursorHidden;
+    NSCursor*   invisibleCursor;
+    BOOL        cursorIsInvisible;
+    BOOL        cursorMayBeShown;
+    NSTimeInterval lastInvisibleCursorTime;
 
     NSTimeInterval lastSetCursorPositionTime;
 
