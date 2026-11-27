@@ -1108,11 +1108,12 @@ static NSString* WineLocalizedString(unsigned int stringID)
     // the hide once back over our window; unhide+hide keeps the count at one.
     - (void) rehideCursor:(BOOL)force
     {
-        NSTimeInterval now = [[NSProcessInfo processInfo] systemUptime];
+        NSTimeInterval now;
 
         if (!cursorHidden || !clientWantsCursorHidden)
             return;
 
+        now = [[NSProcessInfo processInfo] systemUptime];
         if (force || cursorMayBeShown)
         {
             [NSCursor unhide];
