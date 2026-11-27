@@ -162,23 +162,6 @@ static BOOL is_whole_multiple(CGFloat shown, CGFloat size)
     return times >= 1 && fabs(shown - times * size) <= 1;
 }
 
-/* WINE_OBELISK_SCALING: "nearest" or "linear" for a game's picture at every size. */
-static NSString *forced_scaling_filter(void)
-{
-    const char *env = getenv("WINE_OBELISK_SCALING");
-
-    if (env && !strcmp(env, "nearest")) return kCAFilterNearest;
-    if (env && !strcmp(env, "linear")) return kCAFilterLinear;
-    return nil;
-}
-
-/* Whether win32u emulates display modes for this game. */
-static BOOL emulates_modes(void)
-{
-    const char *env = getenv("WINE_OBELISK_EMULATE_MODES");
-    return env && *env && *env != '0';
-}
-
 static inline BOOL stage_manager_enabled(void)
 {
     /* There is no documented way to determine if Stage Manager is enabled,
@@ -993,7 +976,7 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
             self.wantsLayer = YES;
             self.layerContentsRedrawPolicy = NSViewLayerContentsRedrawNever;
 
-            if (emulates_modes())
+            if (emulate_modes)
             {
                 NSNotificationCenter* nc = [NSNotificationCenter defaultCenter];
                 [nc addObserver:self
@@ -1024,7 +1007,7 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
      */
     - (void) updateContentsGravity
     {
-        if (!emulates_modes()) return;
+        if (!emulate_modes) return;
         [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(updateContentsGravity) object:nil];
         keepsShape = NO;
         self.layer.contentsGravity = [NSApp isActive] ? kCAGravityResize : kCAGravityResizeAspect;
@@ -1077,7 +1060,11 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
 
         if (!self.window || drawable.width < 1 || drawable.height < 1) return;
 
-        if (!(filter = forced_scaling_filter()))
+        if (scaling_filter == SCALING_FILTER_NEAREST)
+            filter = kCAFilterNearest;
+        else if (scaling_filter == SCALING_FILTER_LINEAR)
+            filter = kCAFilterLinear;
+        else
         {
             /* the pixels of the screen the drawable is stretched over */
             shown = [self convertRectToBacking:self.bounds].size;

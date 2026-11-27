@@ -58,6 +58,8 @@ bool use_confinement_cursor_clipping = true;
 bool cursor_clipping_locks_windows = true;
 bool use_precise_scrolling = true;
 int scroll_percent = 100;
+int scaling_filter = SCALING_FILTER_AUTO;
+bool emulate_modes = false;
 int gl_surface_mode = GL_SURFACE_IN_FRONT_OPAQUE;
 bool retina_enabled = false;
 bool enable_app_nap = false;
@@ -400,6 +402,16 @@ static void setup_options(void)
         if (end != env)
             scroll_percent = percent < 25 ? 25 : percent > 400 ? 400 : percent;
     }
+
+    /* Obelisk sets how a game's picture is scaled where the driver would pick,
+       and tells when win32u emulates the game's display modes. */
+    if ((env = getenv("WINE_OBELISK_SCALING")))
+    {
+        if (!strcmp(env, "nearest")) scaling_filter = SCALING_FILTER_NEAREST;
+        else if (!strcmp(env, "linear")) scaling_filter = SCALING_FILTER_LINEAR;
+    }
+    env = getenv("WINE_OBELISK_EMULATE_MODES");
+    emulate_modes = env && *env && *env != '0';
 
     /* Don't use appkey.  The DPI and monitor sizes should be consistent for all
        processes in the prefix. */
