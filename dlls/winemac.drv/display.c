@@ -743,6 +743,7 @@ static CGDisplayModeRef find_best_display_mode(DEVMODEW *devmode, CFArrayRef dis
         size_t width = CGDisplayModeGetWidth(display_mode);
         size_t height = CGDisplayModeGetHeight(display_mode);
         double refresh_rate = CGDisplayModeGetRefreshRate(display_mode);
+        BOOL restores;
         if (!refresh_rate)
             refresh_rate = 60;
 
@@ -769,20 +770,15 @@ static CGDisplayModeRef find_best_display_mode(DEVMODEW *devmode, CFArrayRef dis
             continue;
 
         /* The desktop's own mode at the rate asked for restores it. */
-        if (is_original && (DWORD)refresh_rate == devmode->dmDisplayFrequency)
-        {
-            best_display_mode = display_mode;
-            best_refresh_rate = refresh_rate;
-            best = i;
-            break;
-        }
-
-        if (best_display_mode && refresh_rate <= best_refresh_rate)
+        restores = is_original && (DWORD)refresh_rate == devmode->dmDisplayFrequency;
+        if (!restores && best_display_mode && refresh_rate <= best_refresh_rate)
             continue;
 
         best_display_mode = display_mode;
         best_refresh_rate = refresh_rate;
         best = i;
+        if (restores)
+            break;
     }
 
     if (best_display_mode && (DWORD)best_refresh_rate != devmode->dmDisplayFrequency)
